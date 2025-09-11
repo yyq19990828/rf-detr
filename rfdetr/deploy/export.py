@@ -239,8 +239,28 @@ def main(args):
     print(f"number of transformer parameters: {n_transformer_parameters}")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(checkpoint['model'], strict=True)
-        print(f"load checkpoints {args.resume}")
+        
+        # Convert old LayerNorm weights (.bn.*) to new native LayerNorm weights (.ln.*)
+        state_dict = checkpoint['model']
+        converted_state_dict = {}
+        
+        for key, value in state_dict.items():
+            if '.bn.weight' in key:
+                # Convert .bn.weight to .bn.ln.weight (for NativeLayerNorm)
+                new_key = key.replace('.bn.weight', '.bn.ln.weight')
+                converted_state_dict[new_key] = value
+                print(f"Weight mapping: {key} -> {new_key}")
+            elif '.bn.bias' in key:
+                # Convert .bn.bias to .bn.ln.bias (for NativeLayerNorm)
+                new_key = key.replace('.bn.bias', '.bn.ln.bias')
+                converted_state_dict[new_key] = value
+                print(f"Bias mapping: {key} -> {new_key}")
+            else:
+                # Keep other weights unchanged
+                converted_state_dict[key] = value
+        
+        model.load_state_dict(converted_state_dict, strict=True)
+        print(f"load checkpoints {args.resume} (with LayerNorm weight conversion)")
 
     if args.layer_norm:
         no_batch_norm(model)
