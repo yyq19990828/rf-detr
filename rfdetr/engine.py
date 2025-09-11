@@ -63,7 +63,9 @@ def train_one_epoch(
     args=None,
     callbacks: DefaultDict[str, List[Callable]] = None,
 ):
-    metric_logger = utils.MetricLogger(delimiter="  ")
+    # Check if verbose logging is enabled
+    verbose_log = getattr(args, 'verbose_logging', False)
+    metric_logger = utils.MetricLogger(delimiter="  ", verbose_logging=verbose_log)
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     metric_logger.add_meter(
         "class_error", utils.SmoothedValue(window_size=1, fmt="{value:.2f}")
@@ -255,7 +257,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, arg
         model.half()
     criterion.eval()
 
-    metric_logger = utils.MetricLogger(delimiter="  ")
+    # Check if verbose logging is enabled
+    verbose_log = getattr(args, 'verbose_logging', False)
+    metric_logger = utils.MetricLogger(delimiter="  ", verbose_logging=verbose_log)
     metric_logger.add_meter(
         "class_error", utils.SmoothedValue(window_size=1, fmt="{value:.2f}")
     )

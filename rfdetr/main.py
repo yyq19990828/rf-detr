@@ -129,6 +129,9 @@ class Model:
                 if any(name.endswith(x) for x in query_param_names):
                     checkpoint['model'][name] = state[:num_desired_queries]
 
+            # 智能转换LayerNorm权重，兼容新旧两种格式
+            checkpoint['model'] = self._smart_convert_layernorm_weights(checkpoint['model'])
+            
             self.model.load_state_dict(checkpoint['model'], strict=False)
 
         if args.backbone_lora:
@@ -147,6 +150,69 @@ class Model:
         self.model = self.model.to(self.device)
         self.criterion, self.postprocessors = build_criterion_and_postprocessors(args)
         self.stop_early = False
+    
+    def _smart_convert_layernorm_weights(self, state_dict):
+        """智能转换LayerNorm权重，支持ConvXLN和LN之间的双向转换"""
+        
+        # 检查权重字典中的key格式
+        has_convx_format = any('.bn.weight' in key and '.bn.ln.weight' not in key for key in state_dict.keys())
+        has_native_format = any('.bn.ln.weight' in key for key in state_dict.keys())
+        
+        # 检查当前模型需要的格式
+        current_model_keys = set(self.model.state_dict().keys())
+        model_needs_convx = any('.bn.weight' in key and '.bn.ln.weight' not in key for key in current_model_keys)
+        model_needs_native = any('.bn.ln.weight' in key for key in current_model_keys)
+        
+        print(f"预训练权重格式: ConvX格式(.bn.weight)={has_convx_format}, Native格式(.bn.ln.weight)={has_native_format}")
+        print(f"当前模型需要格式: ConvX格式={model_needs_convx}, Native格式={model_needs_native}")
+        
+        # 双向转换逻辑
+        if (has_convx_format and not has_native_format) and model_needs_native:
+            # ConvX -> Native 转换
+            print("转换ConvX格式权重为Native格式...")
+            converted_state_dict = {}
+            conversion_count = 0
+            
+            for key, value in state_dict.items():
+                if '.bn.weight' in key and '.bn.ln.weight' not in key:
+                    new_key = key.replace('.bn.weight', '.bn.ln.weight')
+                    converted_state_dict[new_key] = value
+                    conversion_count += 1
+                elif '.bn.bias' in key and '.bn.ln.bias' not in key:
+                    new_key = key.replace('.bn.bias', '.bn.ln.bias')
+                    converted_state_dict[new_key] = value
+                    conversion_count += 1
+                else:
+                    converted_state_dict[key] = value
+            
+            print(f"转换了 {conversion_count} 个LayerNorm参数")
+            return converted_state_dict
+            
+        elif (has_native_format and not has_convx_format) and model_needs_convx:
+            # Native -> ConvX 转换
+            print("转换Native格式权重为ConvX格式...")
+            converted_state_dict = {}
+            conversion_count = 0
+            
+            for key, value in state_dict.items():
+                if '.bn.ln.weight' in key:
+                    new_key = key.replace('.bn.ln.weight', '.bn.weight')
+                    converted_state_dict[new_key] = value
+                    conversion_count += 1
+                elif '.bn.ln.bias' in key:
+                    new_key = key.replace('.bn.ln.bias', '.bn.bias')
+                    converted_state_dict[new_key] = value
+                    conversion_count += 1
+                else:
+                    converted_state_dict[key] = value
+            
+            print(f"转换了 {conversion_count} 个LayerNorm参数")
+            return converted_state_dict
+        
+        # 如果格式匹配，直接返回
+        else:
+            print("权重格式匹配当前模型，无需转换")
+            return state_dict
     
     def reinitialize_detection_head(self, num_classes):
         self.model.reinitialize_detection_head(num_classes)
@@ -450,10 +516,23 @@ class Model:
         best_is_ema = best_map_ema_5095 > best_map_5095
         
         if utils.is_main_process():
-            if best_is_ema:
+            # 检查是否有有效的 best checkpoint，如果没有则使用最新的 checkpoint
+            best_ema_exists = (output_dir / 'checkpoint_best_ema.pth').exists()
+            best_regular_exists = (output_dir / 'checkpoint_best_regular.pth').exists()
+            
+            if best_is_ema and best_ema_exists:
                 shutil.copy2(output_dir / 'checkpoint_best_ema.pth', output_dir / 'checkpoint_best_total.pth')
-            else:
+            elif not best_is_ema and best_regular_exists:
                 shutil.copy2(output_dir / 'checkpoint_best_regular.pth', output_dir / 'checkpoint_best_total.pth')
+            else:
+                # 如果没有有效的 best checkpoint，使用最新的 checkpoint
+                latest_checkpoint = output_dir / 'checkpoint.pth'
+                if latest_checkpoint.exists():
+                    shutil.copy2(latest_checkpoint, output_dir / 'checkpoint_best_total.pth')
+                    print(f"Warning: No valid best checkpoint found. Using latest checkpoint as fallback.")
+                else:
+                    print(f"Error: No checkpoints found to create checkpoint_best_total.pth")
+                    return  # 直接返回，跳过后续处理
             
             utils.strip_checkpoint(output_dir / 'checkpoint_best_total.pth')
         
@@ -472,8 +551,11 @@ class Model:
             total_time_str = str(datetime.timedelta(seconds=int(total_time)))
             print('Training time {}'.format(total_time_str))
             print('Results saved to {}'.format(output_dir / "results.json"))
-            
         
+        # Synchronize all processes to ensure checkpoint_best_total.pth is ready
+        if args.distributed:
+            torch.distributed.barrier()
+            
         if best_is_ema:
             self.model = self.ema_m.module
         self.model.eval()
@@ -481,13 +563,27 @@ class Model:
 
         if args.run_test:
             best_state_dict = torch.load(output_dir / 'checkpoint_best_total.pth', map_location='cpu', weights_only=False)['model']
-            model.load_state_dict(best_state_dict)
+            
+            # Handle DistributedDataParallel model loading
+            if args.distributed:
+                # If model is wrapped in DDP, load state dict to model.module
+                model.module.load_state_dict(best_state_dict)
+            else:
+                # For non-distributed case, load directly to model
+                model.load_state_dict(best_state_dict)
             model.eval()
 
             test_stats, _ = evaluate(
                 model, criterion, postprocessors, data_loader_test, base_ds_test, device, args=args
             )
-            print(f"Test results: {test_stats}")
+            # Use structured format for test results
+            verbose_test = getattr(args, 'verbose_logging', False)
+            formatted_results = utils.format_test_results(test_stats, verbose=verbose_test)
+            print(formatted_results)
+            
+            # Also print raw JSON for compatibility
+            if getattr(args, 'raw_json_output', False):
+                print(f"\nRaw JSON: {test_stats}")
             with open(output_dir / "results.json", "r") as f:
                 results = json.load(f)
             test_metrics = test_stats["results_json"]["class_map"]

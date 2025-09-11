@@ -168,9 +168,10 @@ def reduce_dict(input_dict, average=True):
 
 
 class MetricLogger(object):
-    def __init__(self, delimiter="\t", wandb_logging=False):
+    def __init__(self, delimiter="\t", wandb_logging=False, verbose_logging=False):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
+        self.verbose_logging = verbose_logging
         if wandb_logging:
             import wandb
             self.wandb = wandb
@@ -193,12 +194,107 @@ class MetricLogger(object):
             type(self).__name__, attr))
 
     def __str__(self):
-        loss_str = []
+        # Group metrics by category
+        main_losses = []
+        decoder_0_losses = []
+        decoder_1_losses = []
+        decoder_2_losses = []
+        encoder_losses = []
+        unscaled_losses = []
+        unscaled_main = []
+        unscaled_decoder_0 = []
+        unscaled_decoder_1 = []
+        unscaled_decoder_2 = []
+        unscaled_encoder = []
+        other_metrics = []
+        
         for name, meter in self.meters.items():
-            loss_str.append(
-                "{}: {}".format(name, str(meter))
-            )
-        return self.delimiter.join(loss_str)
+            metric_str = "{}: {}".format(name, str(meter))
+            
+            if name.endswith('_unscaled'):
+                unscaled_losses.append(metric_str)
+                # Further categorize unscaled metrics
+                base_name = name[:-9]  # Remove '_unscaled'
+                if base_name.endswith('_0'):
+                    unscaled_decoder_0.append(metric_str)
+                elif base_name.endswith('_1'):
+                    unscaled_decoder_1.append(metric_str)
+                elif base_name.endswith('_2'):
+                    unscaled_decoder_2.append(metric_str)
+                elif base_name.endswith('_enc'):
+                    unscaled_encoder.append(metric_str)
+                else:
+                    unscaled_main.append(metric_str)
+            elif name.endswith('_0'):
+                decoder_0_losses.append(metric_str)
+            elif name.endswith('_1'):
+                decoder_1_losses.append(metric_str)
+            elif name.endswith('_2'):
+                decoder_2_losses.append(metric_str)
+            elif name.endswith('_enc'):
+                encoder_losses.append(metric_str)
+            elif name in ['loss', 'loss_ce', 'loss_bbox', 'loss_giou', 'class_error']:
+                main_losses.append(metric_str)
+            else:
+                other_metrics.append(metric_str)
+        
+        # Build categorized output
+        result_parts = []
+        
+        # Main metrics (lr, time, etc.)
+        if other_metrics:
+            result_parts.append(self.delimiter.join(other_metrics))
+        
+        # Main losses
+        if main_losses:
+            result_parts.append("Main: " + self.delimiter.join(main_losses))
+        
+        # Decoder layers
+        if decoder_0_losses:
+            result_parts.append("Dec0: " + self.delimiter.join(decoder_0_losses))
+        if decoder_1_losses:
+            result_parts.append("Dec1: " + self.delimiter.join(decoder_1_losses))
+        if decoder_2_losses:
+            result_parts.append("Dec2: " + self.delimiter.join(decoder_2_losses))
+        
+        # Encoder
+        if encoder_losses:
+            result_parts.append("Enc: " + self.delimiter.join(encoder_losses))
+        
+        # Unscaled metrics - detailed or summary
+        if unscaled_losses:
+            if self.verbose_logging:
+                # Detailed unscaled output
+                unscaled_parts = []
+                if unscaled_main:
+                    unscaled_parts.append("  ├─ Main: " + self.delimiter.join(unscaled_main))
+                if unscaled_decoder_0:
+                    unscaled_parts.append("  ├─ Dec0: " + self.delimiter.join(unscaled_decoder_0))
+                if unscaled_decoder_1:
+                    unscaled_parts.append("  ├─ Dec1: " + self.delimiter.join(unscaled_decoder_1))
+                if unscaled_decoder_2:
+                    unscaled_parts.append("  ├─ Dec2: " + self.delimiter.join(unscaled_decoder_2))
+                if unscaled_encoder:
+                    unscaled_parts.append("  └─ Enc: " + self.delimiter.join(unscaled_encoder))
+                
+                # Fix the last item to use └─
+                if len(unscaled_parts) > 0:
+                    unscaled_parts[-1] = unscaled_parts[-1].replace("├─", "└─")
+                
+                unscaled_str = "Unscaled (" + str(len(unscaled_losses)) + " metrics):\n" + "\n".join(unscaled_parts)
+                result_parts.append(unscaled_str)
+            else:
+                # Summary unscaled output
+                result_parts.append("Unscaled: " + str(len(unscaled_losses)) + " metrics (use verbose_logging=True to expand)")
+        
+        if not result_parts:
+            return ""
+        
+        # Format the tree structure
+        if len(result_parts) == 1:
+            return "\n└─ " + result_parts[0]
+        else:
+            return "\n├─ " + "\n├─ ".join(result_parts[:-1]) + "\n└─ " + result_parts[-1]
 
     def synchronize_between_processes(self):
         for meter in self.meters.values():
@@ -216,22 +312,21 @@ class MetricLogger(object):
         iter_time = SmoothedValue(fmt='{avg:.4f}')
         data_time = SmoothedValue(fmt='{avg:.4f}')
         space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
+        # Header format for the first line
         if torch.cuda.is_available():
-            log_msg = self.delimiter.join([
+            header_msg = self.delimiter.join([
                 header,
                 '[{0' + space_fmt + '}/{1}]',
                 'eta: {eta}',
-                '{meters}',
                 'time: {time}',
                 'data: {data}',
                 'max mem: {memory:.0f}'
             ])
         else:
-            log_msg = self.delimiter.join([
+            header_msg = self.delimiter.join([
                 header,
                 '[{0' + space_fmt + '}/{1}]',
                 'eta: {eta}',
-                '{meters}',
                 'time: {time}',
                 'data: {data}'
             ])
@@ -247,17 +342,20 @@ class MetricLogger(object):
                     if is_main_process():
                         log_dict = {k: v.value for k, v in self.meters.items()}
                         self.wandb.log(log_dict)
+                # Print header line
                 if torch.cuda.is_available():
-                    print(log_msg.format(
+                    header_line = header_msg.format(
                         i, len(iterable), eta=eta_string,
-                        meters=str(self),
                         time=str(iter_time), data=str(data_time),
-                        memory=torch.cuda.max_memory_allocated() / MB))
+                        memory=torch.cuda.max_memory_allocated() / MB)
                 else:
-                    print(log_msg.format(
+                    header_line = header_msg.format(
                         i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time)))
+                        time=str(iter_time), data=str(data_time))
+                
+                # Print header + metrics in multi-line format
+                metrics_str = str(self)
+                print(header_line + metrics_str)
             i += 1
             end = time.time()
         total_time = time.time() - start_time
@@ -504,3 +602,165 @@ def strip_checkpoint(checkpoint):
         'args': state_dict['args'],
     }
     torch.save(new_state_dict, checkpoint)
+
+
+def format_test_results(results_dict, verbose=False):
+    """
+    Format test results into a structured, readable output.
+    
+    Args:
+        results_dict (dict): Test results dictionary
+        verbose (bool): Whether to show detailed unscaled metrics
+    
+    Returns:
+        str: Formatted test results string
+    """
+    if not results_dict:
+        return "No test results available"
+    
+    # Extract different types of metrics
+    loss_metrics = {}
+    unscaled_metrics = {}
+    eval_results = results_dict.get('results_json', {})
+    coco_eval = results_dict.get('coco_eval_bbox', [])
+    
+    # Categorize metrics
+    for key, value in results_dict.items():
+        if key in ['results_json', 'coco_eval_bbox']:
+            continue
+        elif key.endswith('_unscaled'):
+            unscaled_metrics[key] = value
+        elif 'loss' in key or 'class_error' in key:
+            loss_metrics[key] = value
+    
+    # Group loss metrics by category
+    main_losses = {}
+    decoder_0_losses = {}
+    decoder_1_losses = {}
+    decoder_2_losses = {}
+    encoder_losses = {}
+    
+    for key, value in loss_metrics.items():
+        if key.endswith('_0'):
+            decoder_0_losses[key] = value
+        elif key.endswith('_1'):
+            decoder_1_losses[key] = value
+        elif key.endswith('_2'):
+            decoder_2_losses[key] = value
+        elif key.endswith('_enc'):
+            encoder_losses[key] = value
+        else:
+            main_losses[key] = value
+    
+    # Build formatted output
+    lines = ["", "Test Results Summary:", "=" * 50]
+    
+    # Performance Metrics
+    if eval_results:
+        lines.append("Performance Metrics:")
+        map_val = eval_results.get('map', -1.0)
+        precision = eval_results.get('precision', float('nan'))
+        recall = eval_results.get('recall', 0.0)
+        
+        if map_val >= 0:
+            lines.append(f"├─ mAP@[0.5:0.95]: {map_val:.3f}")
+        else:
+            lines.append("├─ mAP@[0.5:0.95]: N/A (no predictions)")
+            
+        if not (precision != precision):  # Check if not NaN
+            lines.append(f"├─ Precision: {precision:.3f}")
+        else:
+            lines.append("├─ Precision: N/A (no predictions)")
+            
+        lines.append(f"└─ Recall: {recall:.3f}")
+        
+        # Class-specific results
+        class_map = eval_results.get('class_map', [])
+        if class_map and len(class_map) > 0:
+            lines.append("")
+            lines.append("Per-Class Results:")
+            for i, cls_result in enumerate(class_map):
+                cls_name = cls_result.get('class', f'class_{i}')
+                cls_map = cls_result.get('map@50:95', -1.0)
+                cls_map50 = cls_result.get('map@50', -1.0)
+                if i == len(class_map) - 1:
+                    prefix = "└─"
+                else:
+                    prefix = "├─"
+                    
+                if cls_map >= 0:
+                    lines.append(f"{prefix} {cls_name}: mAP@[0.5:0.95]={cls_map:.3f}, mAP@0.5={cls_map50:.3f}")
+                else:
+                    lines.append(f"{prefix} {cls_name}: No predictions")
+    
+    lines.append("")
+    
+    # Loss Metrics
+    lines.append("Loss Metrics:")
+    
+    def format_losses(losses_dict, name):
+        if not losses_dict:
+            return []
+        loss_strs = []
+        for key, value in losses_dict.items():
+            if isinstance(value, float):
+                loss_strs.append(f"{key}: {value:.4f}")
+            else:
+                loss_strs.append(f"{key}: {value}")
+        return [f"├─ {name}: {' │ '.join(loss_strs)}"]
+    
+    # Add loss categories
+    lines.extend(format_losses(main_losses, "Main"))
+    lines.extend(format_losses(decoder_0_losses, "Dec0"))
+    lines.extend(format_losses(decoder_1_losses, "Dec1"))
+    lines.extend(format_losses(decoder_2_losses, "Dec2"))
+    lines.extend(format_losses(encoder_losses, "Enc"))
+    
+    # Unscaled metrics
+    if unscaled_metrics:
+        if verbose:
+            lines.append("├─ Unscaled Metrics:")
+            # Group unscaled metrics similarly
+            unscaled_main = {}
+            unscaled_dec0 = {}
+            unscaled_dec1 = {}
+            unscaled_dec2 = {}
+            unscaled_enc = {}
+            
+            for key, value in unscaled_metrics.items():
+                base_name = key[:-9]  # Remove '_unscaled'
+                if base_name.endswith('_0'):
+                    unscaled_dec0[key] = value
+                elif base_name.endswith('_1'):
+                    unscaled_dec1[key] = value
+                elif base_name.endswith('_2'):
+                    unscaled_dec2[key] = value
+                elif base_name.endswith('_enc'):
+                    unscaled_enc[key] = value
+                else:
+                    unscaled_main[key] = value
+            
+            for losses_dict, name in [(unscaled_main, "Main"), (unscaled_dec0, "Dec0"), 
+                                    (unscaled_dec1, "Dec1"), (unscaled_dec2, "Dec2"), 
+                                    (unscaled_enc, "Enc")]:
+                if losses_dict:
+                    loss_strs = []
+                    for key, value in losses_dict.items():
+                        if isinstance(value, float):
+                            loss_strs.append(f"{key}: {value:.4f}")
+                        else:
+                            loss_strs.append(f"{key}: {value}")
+                    lines.append(f"│  ├─ {name}: {' │ '.join(loss_strs)}")
+            
+            # Fix the last unscaled item
+            if lines[-1].startswith("│  ├─"):
+                lines[-1] = lines[-1].replace("│  ├─", "│  └─")
+        else:
+            lines.append(f"└─ Unscaled: {len(unscaled_metrics)} metrics (use verbose=True to expand)")
+    
+    # Fix the last main item if unscaled is not shown or is verbose
+    if lines and lines[-1].startswith("├─") and not verbose:
+        lines[-1] = lines[-1].replace("├─", "└─")
+    
+    lines.append("")
+    return "\n".join(lines)
