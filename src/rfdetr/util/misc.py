@@ -176,9 +176,15 @@ def reduce_dict(input_dict: Dict[str, torch.Tensor], average: bool = True) -> Di
 
 
 class MetricLogger(object):
-    def __init__(self, delimiter: str = "\t", wandb_logging: bool = False) -> None:
+    def __init__(
+        self,
+        delimiter: str = "\t",
+        wandb_logging: bool = False,
+        verbose_logging: bool = False,
+    ) -> None:
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
+        self.verbose_logging = verbose_logging
         if wandb_logging:
             import wandb
 
@@ -200,11 +206,60 @@ class MetricLogger(object):
             return self.__dict__[attr]
         raise AttributeError("'{}' object has no attribute '{}'".format(type(self).__name__, attr))
 
+    def _categorize_metrics(self) -> Dict[str, List[str]]:
+        """Categorize metric names into display groups.
+
+        Returns:
+            Dictionary mapping group names to lists of metric names.
+        """
+        main_names = {"loss", "loss_ce", "loss_bbox", "loss_giou", "class_error"}
+        groups: Dict[str, List[str]] = {
+            "Main": [],
+            "Enc": [],
+            "Unscaled": [],
+            "Other": [],
+        }
+        decoder_groups: Dict[str, List[str]] = {}
+
+        for name in self.meters:
+            if name in main_names:
+                groups["Main"].append(name)
+            elif name.endswith("_unscaled"):
+                groups["Unscaled"].append(name)
+            elif name.endswith("_enc"):
+                groups["Enc"].append(name)
+            elif name.split("_")[-1].isdigit():
+                suffix = name.split("_")[-1]
+                key = f"Dec{suffix}"
+                if key not in decoder_groups:
+                    decoder_groups[key] = []
+                decoder_groups[key].append(name)
+            else:
+                groups["Other"].append(name)
+
+        for key in sorted(decoder_groups):
+            groups[key] = decoder_groups[key]
+
+        return groups
+
     def __str__(self) -> str:
-        loss_str = []
-        for name, meter in self.meters.items():
-            loss_str.append("{}: {}".format(name, str(meter)))
-        return self.delimiter.join(loss_str)
+        groups = self._categorize_metrics()
+        lines: List[str] = []
+        non_empty = [(k, v) for k, v in groups.items() if v]
+
+        for idx, (group_name, names) in enumerate(non_empty):
+            if group_name == "Unscaled" and not self.verbose_logging:
+                is_last_group = idx == len(non_empty) - 1
+                connector = "\u2514\u2500" if is_last_group else "\u251c\u2500"
+                lines.append(f"  {connector} Unscaled: (hidden, enable verbose_logging to show)")
+                continue
+
+            is_last_group = idx == len(non_empty) - 1
+            connector = "\u2514\u2500" if is_last_group else "\u251c\u2500"
+            entries = [f"{n}: {self.meters[n]}" for n in sorted(names)]
+            lines.append(f"  {connector} {group_name}: {self.delimiter.join(entries)}")
+
+        return "\n".join(lines)
 
     def synchronize_between_processes(self) -> None:
         for meter in self.meters.values():
@@ -216,6 +271,16 @@ class MetricLogger(object):
     def log_every(
         self, iterable: Iterable[Any], print_freq: int, header: Optional[str] = None
     ) -> Generator[Any, None, None]:
+        """Log metrics at regular intervals during iteration.
+
+        Args:
+            iterable: The iterable to loop over.
+            print_freq: How often (in iterations) to log metrics.
+            header: Optional prefix string for log messages.
+
+        Yields:
+            Items from the iterable.
+        """
         i = 0
         if not header:
             header = ""
@@ -224,22 +289,6 @@ class MetricLogger(object):
         iter_time = SmoothedValue(fmt="{avg:.4f}")
         data_time = SmoothedValue(fmt="{avg:.4f}")
         space_fmt = ":" + str(len(str(len(iterable)))) + "d"
-        if torch.cuda.is_available():
-            log_msg = self.delimiter.join(
-                [
-                    header,
-                    "[{0" + space_fmt + "}/{1}]",
-                    "eta: {eta}",
-                    "{meters}",
-                    "time: {time}",
-                    "data: {data}",
-                    "max mem: {memory:.0f}",
-                ]
-            )
-        else:
-            log_msg = self.delimiter.join(
-                [header, "[{0" + space_fmt + "}/{1}]", "eta: {eta}", "{meters}", "time: {time}", "data: {data}"]
-            )
         MB = 1024.0 * 1024.0
         for obj in iterable:
             data_time.update(time.time() - end)
@@ -252,24 +301,36 @@ class MetricLogger(object):
                     if is_main_process():
                         log_dict = {k: v.value for k, v in self.meters.items()}
                         self.wandb.log(log_dict)
+                # Build header line with progress info
+                header_parts = [
+                    header,
+                    "[{0" + space_fmt + "}/{1}]",
+                    "eta: {eta}",
+                    "time: {time}",
+                    "data: {data}",
+                ]
                 if torch.cuda.is_available():
-                    logger.info(
-                        log_msg.format(
-                            i,
-                            len(iterable),
-                            eta=eta_string,
-                            meters=str(self),
-                            time=str(iter_time),
-                            data=str(data_time),
-                            memory=torch.cuda.max_memory_allocated() / MB,
-                        )
+                    header_parts.append("max mem: {memory:.0f}")
+                    header_line = self.delimiter.join(header_parts).format(
+                        i,
+                        len(iterable),
+                        eta=eta_string,
+                        time=str(iter_time),
+                        data=str(data_time),
+                        memory=torch.cuda.max_memory_allocated() / MB,
                     )
                 else:
-                    logger.info(
-                        log_msg.format(
-                            i, len(iterable), eta=eta_string, meters=str(self), time=str(iter_time), data=str(data_time)
-                        )
+                    header_line = self.delimiter.join(header_parts).format(
+                        i,
+                        len(iterable),
+                        eta=eta_string,
+                        time=str(iter_time),
+                        data=str(data_time),
                     )
+                logger.info(header_line)
+                metrics_str = str(self)
+                if metrics_str:
+                    logger.info(metrics_str)
             i += 1
             end = time.time()
         total_time = time.time() - start_time
@@ -529,3 +590,95 @@ def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def format_test_results(test_stats: Dict[str, Any], verbose: bool = False) -> str:
+    """Format test/evaluation results into a structured, readable string.
+
+    Organizes results into sections: Performance Metrics (mAP/Precision/Recall),
+    Per-Class Results, and Loss Metrics.
+
+    Args:
+        test_stats: Dictionary of test statistics from evaluation, typically
+            containing ``results_json``, ``coco_eval_bbox``, and loss metrics.
+        verbose: If True, include unscaled loss metrics in the output.
+
+    Returns:
+        Formatted multi-line string with structured test results.
+    """
+    lines: List[str] = []
+    lines.append("=" * 60)
+    lines.append("  Test Results")
+    lines.append("=" * 60)
+
+    # Performance Metrics
+    results_json = test_stats.get("results_json", {})
+    if results_json:
+        lines.append("\u251c\u2500 Performance Metrics:")
+        for key in ("map", "precision", "recall", "f1_score"):
+            value = results_json.get(key)
+            if value is not None:
+                lines.append(f"\u2502    {key}: {value:.4f}")
+
+    # COCO eval stats
+    coco_stats = test_stats.get("coco_eval_bbox")
+    if coco_stats:
+        lines.append("\u251c\u2500 COCO Eval (bbox):")
+        stat_names = [
+            "AP @[IoU=0.50:0.95]",
+            "AP @[IoU=0.50]",
+            "AP @[IoU=0.75]",
+            "AP (small)",
+            "AP (medium)",
+            "AP (large)",
+            "AR @[maxDets=1]",
+            "AR @[maxDets=10]",
+            "AR @[maxDets=100]",
+            "AR (small)",
+            "AR (medium)",
+            "AR (large)",
+        ]
+        for name, val in zip(stat_names, coco_stats):
+            lines.append(f"\u2502    {name}: {val:.4f}")
+
+    # Per-Class Results
+    class_map = results_json.get("class_map", [])
+    if class_map:
+        lines.append("\u251c\u2500 Per-Class Results:")
+        header_fmt = f"\u2502    {'Class':<20} {'mAP@50:95':>10} {'mAP@50':>8} {'Prec':>8} {'Recall':>8} {'F1':>8}"
+        lines.append(header_fmt)
+        lines.append(f"\u2502    {'-' * 72}")
+        for entry in class_map:
+            cls_name = entry.get("class", "?")
+            lines.append(
+                f"\u2502    {cls_name:<20} "
+                f"{entry.get('map@50:95', 0):.4f}     "
+                f"{entry.get('map@50', 0):.4f}   "
+                f"{entry.get('precision', 0):.4f}   "
+                f"{entry.get('recall', 0):.4f}   "
+                f"{entry.get('f1_score', 0):.4f}"
+            )
+
+    # Loss Metrics
+    loss_keys = [k for k in test_stats if not k.startswith("coco_eval") and k != "results_json"]
+    scaled_keys = [k for k in loss_keys if not k.endswith("_unscaled")]
+    unscaled_keys = [k for k in loss_keys if k.endswith("_unscaled")]
+
+    if scaled_keys:
+        lines.append("\u251c\u2500 Loss Metrics:")
+        for key in sorted(scaled_keys):
+            val = test_stats[key]
+            if isinstance(val, float):
+                lines.append(f"\u2502    {key}: {val:.4f}")
+
+    if verbose and unscaled_keys:
+        lines.append("\u251c\u2500 Unscaled Loss Metrics:")
+        for key in sorted(unscaled_keys):
+            val = test_stats[key]
+            if isinstance(val, float):
+                lines.append(f"\u2502    {key}: {val:.4f}")
+    elif unscaled_keys:
+        lines.append("\u251c\u2500 Unscaled: (hidden, enable verbose to show)")
+
+    lines.append("=" * 60)
+    return "\n".join(lines)

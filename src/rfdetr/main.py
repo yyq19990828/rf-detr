@@ -606,7 +606,8 @@ class Model:
             model.eval()
 
             test_stats, _ = evaluate(model, criterion, postprocess, data_loader_test, base_ds_test, device, args=args)
-            logger.info(f"Test results: {test_stats}")
+            verbose = bool(getattr(args, "verbose_logging", False))
+            logger.info(utils.format_test_results(test_stats, verbose=verbose))
             with open(output_dir / "results.json", "r") as f:
                 results = json.load(f)
             test_metrics = test_stats["results_json"]["class_map"]
