@@ -357,7 +357,7 @@ def patched_pycocotools_summarize(self):
 
     def _summarize(ap=1, iouThr=None, areaRng="all", maxDets=100):
         p = self.params
-        iStr = " {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:0.3f}"
+        iStr = " {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:>5s}"
         titleStr = "Average Precision" if ap == 1 else "Average Recall"
         typeStr = "(AP)" if ap == 1 else "(AR)"
         iouStr = "{:0.2f}:{:0.2f}".format(p.iouThrs[0], p.iouThrs[-1]) if iouThr is None else "{:0.2f}".format(iouThr)
@@ -383,7 +383,8 @@ def patched_pycocotools_summarize(self):
             mean_s = -1
         else:
             mean_s = np.mean(s[s > -1])
-        logger.info(iStr.format(titleStr, typeStr, iouStr, areaRng, maxDets, mean_s))
+        display_s = "N/A" if mean_s == -1 else "{:0.3f}".format(mean_s)
+        logger.info(iStr.format(titleStr, typeStr, iouStr, areaRng, maxDets, display_s))
         return mean_s
 
     def _summarizeDets():
