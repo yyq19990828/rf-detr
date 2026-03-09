@@ -89,7 +89,10 @@ class RFDETR:
         """
         Download pre-trained weights if they are not already downloaded.
         """
-        download_pretrain_weights(self.model_config.pretrain_weights)
+        pretrain_weights = self.model_config.pretrain_weights
+        if pretrain_weights is None:
+            return
+        download_pretrain_weights(pretrain_weights)
 
     def get_model_config(self, **kwargs):
         """
@@ -98,11 +101,95 @@ class RFDETR:
         return ModelConfig(**kwargs)
 
     def train(self, **kwargs):
+        """Train via the legacy engine.py / main.py training stack (baseline).
+
+        All keyword arguments are forwarded to :meth:`get_train_config` to build
+        a :class:`~rfdetr.config.TrainConfig`, then on to :meth:`train_from_config`
+        which drives the legacy ``engine.py`` training loop.
+
+        The ``callbacks`` kwarg (if provided) is merged into ``self.callbacks``
+        before training starts so that caller-supplied hooks are honoured.
         """
-        Train an RF-DETR model.
-        """
+        # Merge any explicit callbacks dict into self.callbacks.
+        callbacks_dict = kwargs.pop("callbacks", None)
+        if callbacks_dict:
+            for key, fns in callbacks_dict.items():
+                if callable(fns):
+                    self.callbacks[key].append(fns)
+                else:
+                    self.callbacks[key].extend(fns)
+
         config = self.get_train_config(**kwargs)
         self.train_from_config(config, **kwargs)
+
+    def train_ptl(self, **kwargs):
+        """Train an RF-DETR model via the PyTorch Lightning stack.
+
+        All keyword arguments are forwarded to :meth:`get_train_config` to build
+        a :class:`~rfdetr.config.TrainConfig`.  Two legacy kwargs are absorbed
+        silently so existing call-sites do not break:
+
+        * ``device`` — dropped; PTL selects the accelerator automatically.
+        * ``callbacks`` — if the dict contains any non-empty lists a
+          :class:`DeprecationWarning` is emitted; the dict is then discarded.
+          Use PTL :class:`~pytorch_lightning.Callback` objects passed via
+          :func:`~rfdetr.lit.build_trainer` instead.
+
+        After training completes the underlying ``nn.Module`` is synced back
+        onto ``self.model.model`` so that :meth:`predict` and :meth:`export`
+        continue to work without reloading the checkpoint.
+        """
+        from rfdetr.lit import RFDETRDataModule, RFDETRModule, build_trainer
+
+        # Absorb legacy `callbacks` dict — warn if non-empty, then discard.
+        callbacks_dict = kwargs.pop("callbacks", None)
+        if callbacks_dict and any(callbacks_dict.values()):
+            warnings.warn(
+                "Custom callbacks dict is not forwarded to PTL. Use PTL Callback objects instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        # Absorb legacy `device` kwarg.  When the caller explicitly requests CPU
+        # (e.g. in tests or CPU-only environments), honour it by forwarding it as
+        # the PTL accelerator.  All other device strings (cuda, mps) are ignored
+        # so PTL can auto-select the best available device.
+        #
+        # FIXME(Chapter 6): the correct fix is to promote `device` to a proper
+        # `TrainConfig.accelerator` field (see Decision #11 / risk table row 4
+        # in MIGRATION_PT_LIGHTNING.md).  The current workaround only handles
+        # the `"cpu"` case and silently drops `"cuda"` / `"mps"` — PTL's
+        # `accelerator="auto"` picks the right hardware for those anyway, but
+        # explicit overrides (e.g. `device="mps"` on a CUDA machine) are lost.
+        _device = kwargs.pop("device", None)
+        _accelerator = "cpu" if _device == "cpu" else "auto"
+
+        # Absorb legacy `start_epoch` — PTL resumes automatically via ckpt_path.
+        if "start_epoch" in kwargs:
+            warnings.warn(
+                "`start_epoch` is deprecated and ignored; PTL resumes automatically via `resume`.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            kwargs.pop("start_epoch")
+
+        # Pop `do_benchmark`; benchmarking via `.train()` is deprecated.
+        run_benchmark = bool(kwargs.pop("do_benchmark", False))
+        if run_benchmark:
+            warnings.warn(
+                "`do_benchmark` in `.train()` is deprecated; use `rfdetr benchmark`.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        config = self.get_train_config(**kwargs)
+        module = RFDETRModule(self.model_config, config)
+        datamodule = RFDETRDataModule(self.model_config, config)
+        trainer = build_trainer(config, self.model_config, accelerator=_accelerator)
+        trainer.fit(module, datamodule, ckpt_path=config.resume or None)
+
+        # Sync the trained weights back so predict() / export() see the updated model.
+        self.model.model = module.model
 
     def optimize_for_inference(self, compile=True, batch_size=1, dtype=torch.float32):
         self.remove_optimized_model()
@@ -144,20 +231,31 @@ class RFDETR:
         self.model.export(**kwargs)
 
     @staticmethod
-    def _load_classes(dataset_dir) -> List[str]:
+    def _load_classes(dataset_dir: str) -> List[str]:
         """Load class names from a COCO or YOLO dataset directory."""
         if is_valid_coco_dataset(dataset_dir):
             coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
             with open(coco_path, "r") as f:
                 anns = json.load(f)
-            categories = anns["categories"]
-            supercategory_names = {c["name"] for c in categories}
-            has_hierarchy = any(c.get("supercategory", "none") in supercategory_names for c in categories)
-            if has_hierarchy:
-                class_names = [c["name"] for c in categories if c.get("supercategory", "none") != "none"]
-            else:
-                class_names = [c["name"] for c in categories]
-            return class_names
+            categories = sorted(anns["categories"], key=lambda category: category.get("id", float("inf")))
+
+            # Catch possible placeholders for no supercategory
+            placeholders = {"", "none", "null", None}
+
+            # If no meaningful supercategory exists anywhere, treat as flat dataset
+            has_any_sc = any(c.get("supercategory", "none") not in placeholders for c in categories)
+            if not has_any_sc:
+                return [c["name"] for c in categories]
+
+            # Mixed/Hierarchical: keep only categories that are not parents of other categories.
+            # Both leaves (with a real supercategory) and standalone top-level nodes (supercategory is a
+            # placeholder) satisfy this condition — neither appears as another category's supercategory.
+            parents = {c.get("supercategory") for c in categories if c.get("supercategory", "none") not in placeholders}
+            has_children = {c["name"] for c in categories if c["name"] in parents}
+
+            class_names = [c["name"] for c in categories if c["name"] not in has_children]
+            # Safety fallback for pathological inputs
+            return class_names or [c["name"] for c in categories]
 
         # list all YAML files in the folder
         if is_valid_yolo_dataset(dataset_dir):
@@ -173,7 +271,6 @@ class RFDETR:
                 return data["names"]
             else:
                 raise ValueError(f"Found {yaml_path} but it does not contain 'names' field.")
-
         raise FileNotFoundError(
             f"Could not find class names in {dataset_dir}. "
             "Checked for COCO (train/_annotations.coco.json) and YOLO (data.yaml, data.yml) styles."
@@ -198,8 +295,8 @@ class RFDETR:
             logger.warning(f"Reinitializing your detection head with {num_classes} classes.")
             self.model.reinitialize_detection_head(num_classes)
 
-        train_config = config.dict()
-        model_config = self.model_config.dict()
+        train_config = config.model_dump()
+        model_config = self.model_config.model_dump()
         model_config.pop("num_classes")
         if "class_names" in model_config:
             model_config.pop("class_names")
@@ -283,7 +380,7 @@ class RFDETR:
         """
         Retrieve a model instance based on the provided configuration.
         """
-        return Model(**config.dict())
+        return Model(**config.model_dump())
 
     # Get class_names from the model
     @property
