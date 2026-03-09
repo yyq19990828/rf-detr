@@ -179,6 +179,7 @@ cython_debug/
 # model artifacts
 rf-detr*
 output/*
+output*/
 
 train_test.py
 
@@ -187,6 +188,12 @@ test_visualizations/
 
 # datasets
 data/
+/dataset*/
+
+# model weights and exports
+**/*.pth
+**/*.onnx
+**/*.pt
 
 debugging/
 
