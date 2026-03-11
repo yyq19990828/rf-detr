@@ -428,20 +428,19 @@ class OnnxOptimizer:
         Insert LayerNorm plugin for ConvNeXt-style LayerNorm operations.
         This LayerNorm variant is used for 4D inputs (batch_size, channels, height, width)
         and performs normalization over the channel dimension.
-        
+
         Expected ONNX pattern:
         Conv -> ReduceMean -> Sub -> [Pow, Div] -> ReduceMean -> Add -> Sqrt -> Div -> Mul -> Add
-        
+
         Key difference from standard LayerNorm:
         - Mul operator inputs have shape (C, 1, 1) instead of (C,)
         - Previous node is typically a Conv operation
         """
         nConvXLayerNormPlugin = 0
-        
-        
+
         # New approach: Start from Mul nodes with (C,1,1) constants and trace back
         for node in self.graph.nodes:
-            if node.op == 'Mul':
+            if node.op == "Mul":
                 try:
                     # Find the constant input (gamma parameter)
                     gamma_input_idx = None
@@ -451,32 +450,32 @@ class OnnxOptimizer:
                             if len(shape) == 3 and shape[1] == 1 and shape[2] == 1 and shape[0] > 1:
                                 gamma_input_idx = i
                                 break
-                    
+
                     if gamma_input_idx is None:
                         continue
-                    
+
                     # Get the non-constant input (normalized data)
                     data_input_idx = 1 - gamma_input_idx
                     data_input = node.inputs[data_input_idx]
-                    
+
                     # Find the input tensor for LayerNorm (should be several nodes back)
                     # Trace back through the normalization chain to find the original input
                     current_tensor = data_input
                     input_tensor = None
-                    
+
                     # Try to trace back to find the input tensor
                     for _ in range(15):  # Max 15 steps back (increased for standalone LayerNorm)
                         if len(current_tensor.inputs) == 0:
                             break
                         prev_node = current_tensor.inputs[0]
-                        if prev_node.op in ['Conv', 'Add', 'Concat', 'Reshape'] and len(prev_node.inputs) > 0:
+                        if prev_node.op in ["Conv", "Add", "Concat", "Reshape"] and len(prev_node.inputs) > 0:
                             # Found a likely input source
-                            if prev_node.op in ['Conv', 'Concat']:
+                            if prev_node.op in ["Conv", "Concat"]:
                                 input_tensor = current_tensor
                             else:
                                 input_tensor = prev_node.inputs[0]
                             break
-                        elif prev_node.op in ['ReduceMean', 'Sub', 'Pow', 'Div', 'Sqrt', 'Add']:
+                        elif prev_node.op in ["ReduceMean", "Sub", "Pow", "Div", "Sqrt", "Add"]:
                             # Continue tracing back through LayerNorm operations
                             if len(prev_node.inputs) > 0:
                                 current_tensor = prev_node.inputs[0]
@@ -488,50 +487,56 @@ class OnnxOptimizer:
                                 input_tensor = current_tensor
                                 break
                             break
-                    
+
                     if input_tensor is None:
                         # Last attempt: use the data input directly for standalone LayerNorm
                         input_tensor = data_input
-                    
+
                     # Extract gamma parameter
                     gamma = np.array(deepcopy(node.inputs[gamma_input_idx].values.tolist()), dtype=np.float32)
-                    constantGamma = gs.Constant("ConvXLayerNormGamma-" + str(nConvXLayerNormPlugin), 
-                                              np.ascontiguousarray(gamma.reshape(-1)))
-                    
+                    constantGamma = gs.Constant(
+                        "ConvXLayerNormGamma-" + str(nConvXLayerNormPlugin), np.ascontiguousarray(gamma.reshape(-1))
+                    )
+
                     # Find the Add node (beta) that follows this Mul
                     if len(node.outputs) == 0 or len(node.outputs[0].outputs) == 0:
                         continue
-                    
+
                     add_node = node.outputs[0].outputs[0]
-                    if add_node.op != 'Add':
+                    if add_node.op != "Add":
                         continue
-                    
+
                     # Find beta parameter in Add node
                     beta_input_idx = None
                     for i, input_tensor_beta in enumerate(add_node.inputs):
                         if type(input_tensor_beta) == gs.ir.tensor.Constant:
                             beta_input_idx = i
                             break
-                    
+
                     if beta_input_idx is None:
                         continue
-                    
+
                     # Extract beta parameter
                     beta = np.array(deepcopy(add_node.inputs[beta_input_idx].values.tolist()), dtype=np.float32)
-                    constantBeta = gs.Constant("ConvXLayerNormBeta-" + str(nConvXLayerNormPlugin), 
-                                             np.ascontiguousarray(beta.reshape(-1)))
-                    
+                    constantBeta = gs.Constant(
+                        "ConvXLayerNormBeta-" + str(nConvXLayerNormPlugin), np.ascontiguousarray(beta.reshape(-1))
+                    )
+
                     # Create LayerNorm plugin node
                     inputList = [input_tensor, constantGamma, constantBeta]
-                    layerNormV = gs.Variable("ConvXLayerNormV-" + str(nConvXLayerNormPlugin), 
-                                           np.dtype(np.float32), input_tensor.shape)
-                    layerNormN = gs.Node("LayerNorm", "ConvXLayerNormN-" + str(nConvXLayerNormPlugin), 
-                                       inputs=inputList, 
-                                       attrs=OrderedDict([('epsilon', 1.e-6)]),
-                                       outputs=[layerNormV])
+                    layerNormV = gs.Variable(
+                        "ConvXLayerNormV-" + str(nConvXLayerNormPlugin), np.dtype(np.float32), input_tensor.shape
+                    )
+                    layerNormN = gs.Node(
+                        "LayerNorm",
+                        "ConvXLayerNormN-" + str(nConvXLayerNormPlugin),
+                        inputs=inputList,
+                        attrs=OrderedDict([("epsilon", 1.0e-6)]),
+                        outputs=[layerNormV],
+                    )
                     self.graph.nodes.append(layerNormN)
                     nConvXLayerNormPlugin += 1
-                    
+
                     # Replace connections - redirect all consumers of the final Add node
                     if len(add_node.outputs) > 0:
                         output_tensor = add_node.outputs[0]
@@ -539,52 +544,52 @@ class OnnxOptimizer:
                         if output_tensor in self.graph.outputs:
                             index = self.graph.outputs.index(output_tensor)
                             self.graph.outputs[index] = layerNormV
-                        
+
                         # Replace in all consumer nodes
                         consumers = list(output_tensor.outputs)  # Make a copy to avoid modification during iteration
                         for consumer_node in consumers:
                             for i, inp in enumerate(consumer_node.inputs):
                                 if inp == output_tensor:
                                     consumer_node.inputs[i] = layerNormV
-                    
+
                     # Clear the entire LayerNorm computation chain by tracing back and marking for removal
                     nodes_to_remove = []
-                    
+
                     # Mark the final Mul and Add nodes
                     nodes_to_remove.append(node)
                     nodes_to_remove.append(add_node)
-                    
+
                     # Trace back from the Mul node to mark all LayerNorm computation nodes
                     current_tensor = data_input
                     for _ in range(15):  # Max trace depth
                         if len(current_tensor.inputs) == 0:
                             break
                         prev_node = current_tensor.inputs[0]
-                        
+
                         # Mark LayerNorm operation nodes for removal
-                        if prev_node.op in ['ReduceMean', 'Sub', 'Pow', 'Div', 'Sqrt', 'Add']:
+                        if prev_node.op in ["ReduceMean", "Sub", "Pow", "Div", "Sqrt", "Add"]:
                             # Only remove if this node is exclusively used for this LayerNorm
                             if len(prev_node.outputs) == 1 and len(prev_node.outputs[0].outputs) <= 1:
                                 if prev_node not in nodes_to_remove:  # Avoid duplicates
                                     nodes_to_remove.append(prev_node)
-                        elif prev_node.op == 'Div':
+                        elif prev_node.op == "Div":
                             # Special handling for Div nodes that might be shared
                             if prev_node not in nodes_to_remove:
                                 nodes_to_remove.append(prev_node)
                         else:
                             break
-                            
+
                         # Move to the next node in the chain
                         if len(prev_node.inputs) > 0:
                             current_tensor = prev_node.inputs[0]
                         else:
                             break
-                    
+
                     # Actually remove the nodes by clearing their inputs and outputs
                     for remove_node in nodes_to_remove:
                         remove_node.inputs.clear()
                         remove_node.outputs.clear()
-                    
+
                 except (IndexError, AttributeError, ValueError):
                     # Skip nodes that can't be processed
                     continue

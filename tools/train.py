@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
+"""
+RF-DETR 训练脚本
+
+使用命令行参数进行模型训练的优化脚本。
+支持多种模型变体和完整的训练参数配置。
+
+使用示例:
+    python tools/train.py --model medium --dataset-dir datasets/coco --epochs 100
+    python tools/train.py --model nano --dataset-dir datasets/custom --batch-size 8 --lr 2e-4
+    python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100
+"""
+
+import argparse
+from pathlib import Path
+from typing import Any, Dict, List, Union
+
+from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
+from rfdetr.detr import RFDETRBase
+
+
+def create_model_factory():
+    """
+    创建模型工厂函数，根据模型名称返回相应的模型实例。
+
+    Returns:
+        Dict[str, callable]: 模型名称到模型类的映射
+    """
+    return {"nano": RFDETRNano, "small": RFDETRSmall, "medium": RFDETRMedium, "large": RFDETRLarge, "base": RFDETRBase}
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    解析命令行参数。
+
+    Returns:
+        argparse.Namespace: 解析后的参数
+    """
+    parser = argparse.ArgumentParser(
+        description="RF-DETR 模型训练脚本",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  python tools/train.py --model medium --dataset-dir datasets/coco --epochs 100
+  python tools/train.py --model nano --dataset-dir datasets/custom --batch-size 8 --lr 2e-4
+  python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100
+  python tools/train.py --model small --dataset-dir datasets/custom --early-stopping --wandb
+        """,
+    )
+
+    # 模型选择
+    parser.add_argument(
+        "--model",
+        "-m",
+        type=str,
+        choices=["nano", "small", "medium", "large", "base"],
+        default="medium",
+        help="选择模型变体 (默认: medium)",
+    )
+
+    # 数据集参数
+    parser.add_argument(
+        "--dataset-dir",
+        type=str,
+        action="append",
+        required=True,
+        help="数据集目录路径。可重复传入实现多目录联合训练，例如 --dataset-dir d1 --dataset-dir d2",
+    )
+
+    # 训练基础参数
+    parser.add_argument("--epochs", type=int, default=100, help="训练轮数 (默认: 100)")
+
+    parser.add_argument("--batch-size", type=int, default=4, help="批大小 (默认: 4)")
+
+    parser.add_argument("--grad-accum-steps", type=int, default=4, help="梯度累积步数 (默认: 4)")
+
+    # 学习率参数
+    parser.add_argument("--lr", type=float, default=1e-4, help="主学习率 (默认: 1e-4)")
+
+    parser.add_argument("--lr-encoder", type=float, default=1.5e-4, help="编码器学习率 (默认: 1.5e-4)")
+
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="权重衰减 (默认: 1e-4)")
+
+    # 输出目录
+    parser.add_argument("--output-dir", type=str, default="output", help="输出目录 (默认: output)")
+
+    # EMA 参数
+    parser.add_argument("--use-ema", action="store_true", default=True, help="使用指数移动平均 (默认: True)")
+
+    parser.add_argument("--no-ema", dest="use_ema", action="store_false", help="禁用指数移动平均")
+
+    parser.add_argument("--ema-decay", type=float, default=0.993, help="EMA衰减率 (默认: 0.993)")
+
+    # 早停参数
+    parser.add_argument("--early-stopping", action="store_true", default=False, help="启用早停机制")
+
+    parser.add_argument("--early-stopping-patience", type=int, default=10, help="早停耐心值 (默认: 10)")
+
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.001, help="早停最小改进量 (默认: 0.001)")
+
+    # 日志记录
+    parser.add_argument("--tensorboard", action="store_true", default=True, help="启用TensorBoard日志 (默认: True)")
+
+    parser.add_argument("--no-tensorboard", dest="tensorboard", action="store_false", help="禁用TensorBoard日志")
+
+    parser.add_argument("--wandb", action="store_true", default=False, help="启用Weights & Biases日志")
+
+    parser.add_argument("--project", type=str, default=None, help="W&B项目名称")
+
+    parser.add_argument("--run", type=str, default=None, help="W&B运行名称")
+
+    # 数据处理参数
+    parser.add_argument("--num-workers", type=int, default=2, help="数据加载器工作进程数 (默认: 2)")
+
+    parser.add_argument("--multi-scale", action="store_true", default=True, help="启用多尺度训练 (默认: True)")
+
+    parser.add_argument("--no-multi-scale", dest="multi_scale", action="store_false", help="禁用多尺度训练")
+
+    # 进度条
+    parser.add_argument("--progress-bar", action="store_true", default=True, help="显示 tqdm 训练进度条 (默认: True)")
+
+    parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false", help="禁用 tqdm 训练进度条")
+
+    # 其他训练参数
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="检查点保存间隔 (默认: 10)")
+
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="学习率预热轮数 (默认: 0)")
+
+    parser.add_argument("--lr-drop", type=int, default=100, help="学习率衰减轮数 (默认: 100)")
+
+    parser.add_argument("--run-test", action="store_true", default=True, help="训练完成后运行测试 (默认: True)")
+
+    parser.add_argument("--no-test", dest="run_test", action="store_false", help="训练完成后不运行测试")
+
+    return parser.parse_args()
+
+
+def get_model_from_factory(model_name: str) -> Any:
+    """
+    从工厂函数获取模型实例。
+
+    Args:
+        model_name: 模型名称
+
+    Returns:
+        模型实例
+    """
+    factory = create_model_factory()
+    if model_name not in factory:
+        raise ValueError(f"不支持的模型: {model_name}, 支持的模型: {list(factory.keys())}")
+
+    return factory[model_name](layer_norm=True)
+
+
+def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    准备训练参数字典。
+
+    Args:
+        args: 解析后的命令行参数
+
+    Returns:
+        Dict[str, Any]: 训练参数字典
+    """
+    train_kwargs = {
+        "dataset_dir": normalize_dataset_dirs(args.dataset_dir),
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "grad_accum_steps": args.grad_accum_steps,
+        "lr": args.lr,
+        "lr_encoder": args.lr_encoder,
+        "weight_decay": args.weight_decay,
+        "output_dir": args.output_dir,
+        "use_ema": args.use_ema,
+        "ema_decay": args.ema_decay,
+        "early_stopping": args.early_stopping,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
+        "tensorboard": args.tensorboard,
+        "wandb": args.wandb,
+        "project": args.project,
+        "run": args.run,
+        "num_workers": args.num_workers,
+        "multi_scale": args.multi_scale,
+        "checkpoint_interval": args.checkpoint_interval,
+        "warmup_epochs": args.warmup_epochs,
+        "lr_drop": args.lr_drop,
+        "run_test": args.run_test,
+        "progress_bar": args.progress_bar,
+    }
+
+    # 移除None值
+    return {k: v for k, v in train_kwargs.items() if v is not None}
+
+
+def normalize_dataset_dirs(raw_dataset_dirs: List[str]) -> Union[str, List[str]]:
+    dataset_dirs: List[str] = []
+    for raw_dir in raw_dataset_dirs:
+        for part in raw_dir.split(","):
+            candidate = part.strip()
+            if candidate:
+                dataset_dirs.append(candidate)
+
+    if not dataset_dirs:
+        raise ValueError("至少需要提供一个 --dataset-dir")
+
+    if len(dataset_dirs) == 1:
+        return dataset_dirs[0]
+    return dataset_dirs
+
+
+def ensure_data_yaml_in_dataset_dir(dataset_dir: str) -> None:
+    dataset_path = Path(dataset_dir)
+    if (dataset_path / "data.yaml").exists() or (dataset_path / "data.yml").exists():
+        return
+
+    classes_yaml = dataset_path / "classes.yaml"
+    classes_yml = dataset_path / "classes.yml"
+
+    source_file = classes_yaml if classes_yaml.exists() else classes_yml if classes_yml.exists() else None
+    if source_file is None:
+        return
+
+    target_file = dataset_path / "data.yaml"
+    try:
+        target_file.symlink_to(source_file.name)
+    except OSError:
+        target_file.write_text(source_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def ensure_dataset_data_yamls(dataset_dirs: Union[str, List[str]]) -> None:
+    dirs = [dataset_dirs] if isinstance(dataset_dirs, str) else dataset_dirs
+    for dataset_dir in dirs:
+        ensure_data_yaml_in_dataset_dir(dataset_dir)
+
+
+def main():
+    """主函数"""
+    args = parse_arguments()
+    dataset_dir_arg = normalize_dataset_dirs(args.dataset_dir)
+
+    print(f"开始训练 RF-DETR-{args.model.capitalize()} 模型...")
+    if isinstance(dataset_dir_arg, list):
+        print(f"数据集目录数量: {len(dataset_dir_arg)}")
+        print(f"数据集目录: {dataset_dir_arg}")
+    else:
+        print(f"数据集目录: {dataset_dir_arg}")
+    print(f"训练轮数: {args.epochs}")
+    print(f"批大小: {args.batch_size}")
+    print(f"学习率: {args.lr}")
+    print(f"输出目录: {args.output_dir}")
+    print("-" * 50)
+
+    ensure_dataset_data_yamls(dataset_dir_arg)
+
+    # 创建模型
+    model = get_model_from_factory(args.model)
+
+    # 准备训练参数
+    train_kwargs = prepare_train_kwargs(args)
+
+    # 开始训练
+    model.train(**train_kwargs)
+
+    print("训练完成!")
+
+
+if __name__ == "__main__":
+    main()
