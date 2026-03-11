@@ -617,64 +617,70 @@ class CocoLikeAPI:
         self.sv_dataset = dataset
         self.image_sizes = image_sizes
 
-        self.dataset = self._build_coco_dataset()
-        self.imgs = {img["id"]: img for img in self.dataset["images"]}
-        self.anns = {ann["id"]: ann for ann in self.dataset["annotations"]}
-        self.cats = {cat["id"]: cat for cat in self.dataset["categories"]}
+        # Build COCO dataset dict and all lookup indices in a single pass.
+        self._build_all()
 
-        self.imgToAnns: dict[int, list] = {}
-        for ann in self.dataset["annotations"]:
-            img_id = ann["image_id"]
-            if img_id not in self.imgToAnns:
-                self.imgToAnns[img_id] = []
-            self.imgToAnns[img_id].append(ann)
+    def _build_all(self) -> None:
+        """Build COCO-format dataset dict and all lookup indices in one pass.
 
-        for img_id in self.imgs:
-            if img_id not in self.imgToAnns:
-                self.imgToAnns[img_id] = []
+        Merges what were previously separate build + index phases into a single
+        traversal over images/annotations.  Key optimisations vs the naive
+        approach:
 
-        self.catToImgs: dict[int, list] = {}
-        for cat_id in self.cats:
-            self.catToImgs[cat_id] = []
-        for ann in self.dataset["annotations"]:
-            cat_id = ann["category_id"]
-            img_id = ann["image_id"]
-            if img_id not in self.catToImgs[cat_id]:
-                self.catToImgs[cat_id].append(img_id)
+        * ``catToImgs`` uses intermediate ``set`` (O(1) membership) instead of
+          ``list`` with ``in`` check (O(n) per annotation → O(n²) total).
+        * ``imgToAnns`` / ``anns`` / ``imgs`` dicts are populated during the
+          build loop rather than via extra passes over the final list.
+        * ``sv.xyxy_to_xywh`` is called once per image (batch), not per box.
+        * Per-image ``xywh.tolist()`` bulk-converts the entire numpy array
+          instead of calling ``float()`` 4× per annotation.
+        """
+        categories: list[dict[str, Any]] = [
+            {"id": idx, "name": name, "supercategory": "none"} for idx, name in enumerate(self.classes)
+        ]
 
-    def _build_coco_dataset(self) -> dict:
-        """Build a COCO-format dataset dict from cached annotations + sizes."""
-        images = []
-        annotations = []
-        categories = []
-
-        for idx, class_name in enumerate(self.classes):
-            categories.append({"id": idx, "name": class_name, "supercategory": "none"})
+        images: list[dict[str, Any]] = []
+        annotations: list[dict[str, Any]] = []
+        imgs: dict[int, dict[str, Any]] = {}
+        anns: dict[int, dict[str, Any]] = {}
+        img_to_anns: dict[int, list[dict[str, Any]]] = {}
+        cat_to_imgs_set: dict[int, set[int]] = {idx: set() for idx in range(len(self.classes))}
 
         ann_id = 0
         for img_id, image_path in enumerate(self.sv_dataset.image_paths):
             detections = self.sv_dataset.annotations[image_path]
             w, h = self.image_sizes.get(image_path, (0, 0))
 
-            images.append({"id": img_id, "file_name": str(image_path), "height": h, "width": w})
+            img_dict: dict[str, Any] = {
+                "id": img_id,
+                "file_name": str(image_path),
+                "height": h,
+                "width": w,
+            }
+            images.append(img_dict)
+            imgs[img_id] = img_dict
 
             n_det = len(detections)
             if n_det == 0:
+                img_to_anns[img_id] = []
                 continue
 
-            # Batch-convert all boxes at once instead of per-annotation calls
-            xywh = sv.xyxy_to_xywh(detections.xyxy)
+            # Batch-convert all boxes at once and materialise as Python lists
+            xywh_list = sv.xyxy_to_xywh(detections.xyxy).tolist()
+            class_ids = detections.class_id.tolist()
             has_mask = detections.mask is not None
 
+            img_anns: list[dict[str, Any]] = []
             for i in range(n_det):
-                bx, by, bw, bh = xywh[i]
+                bx, by, bw, bh = xywh_list[i]
+                cat_id = class_ids[i]
 
                 ann: dict[str, Any] = {
                     "id": ann_id,
                     "image_id": img_id,
-                    "category_id": int(detections.class_id[i]),
-                    "bbox": [float(bx), float(by), float(bw), float(bh)],
-                    "area": float(bw * bh),
+                    "category_id": cat_id,
+                    "bbox": [bx, by, bw, bh],
+                    "area": bw * bh,
                     "iscrowd": 0,
                 }
 
@@ -682,14 +688,24 @@ class CocoLikeAPI:
                     ann["segmentation"] = []
 
                 annotations.append(ann)
+                anns[ann_id] = ann
+                img_anns.append(ann)
+                cat_to_imgs_set[cat_id].add(img_id)
                 ann_id += 1
 
-        return {
+            img_to_anns[img_id] = img_anns
+
+        self.dataset: dict[str, Any] = {
             "info": {"description": "RF-DETR YOLO dataset"},
             "images": images,
             "annotations": annotations,
             "categories": categories,
         }
+        self.imgs = imgs
+        self.anns = anns
+        self.cats: dict[int, dict[str, Any]] = {cat["id"]: cat for cat in categories}
+        self.imgToAnns: dict[int, list] = img_to_anns
+        self.catToImgs: dict[int, list] = {cat_id: list(img_set) for cat_id, img_set in cat_to_imgs_set.items()}
 
     def getAnnIds(self, imgIds=None, catIds=None, areaRng=None, iscrowd=None):
         """Get annotation IDs that satisfy given filter conditions.
