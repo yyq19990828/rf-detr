@@ -231,37 +231,37 @@ class RFDETR:
         self.model.export(**kwargs)
 
     @staticmethod
-    def _load_classes(dataset_dir: str) -> List[str]:
-        """Load class names from a COCO or YOLO dataset directory."""
+    def _load_classes_single(dataset_dir: str) -> List[str]:
+        """Load class names from a single COCO or YOLO dataset directory."""
         if is_valid_coco_dataset(dataset_dir):
             coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
             with open(coco_path, "r") as f:
                 anns = json.load(f)
             categories = sorted(anns["categories"], key=lambda category: category.get("id", float("inf")))
 
-            # Catch possible placeholders for no supercategory
             placeholders = {"", "none", "null", None}
 
-            # If no meaningful supercategory exists anywhere, treat as flat dataset
             has_any_sc = any(c.get("supercategory", "none") not in placeholders for c in categories)
             if not has_any_sc:
                 return [c["name"] for c in categories]
 
-            # Mixed/Hierarchical: keep only categories that are not parents of other categories.
-            # Both leaves (with a real supercategory) and standalone top-level nodes (supercategory is a
-            # placeholder) satisfy this condition — neither appears as another category's supercategory.
             parents = {c.get("supercategory") for c in categories if c.get("supercategory", "none") not in placeholders}
             has_children = {c["name"] for c in categories if c["name"] in parents}
 
             class_names = [c["name"] for c in categories if c["name"] not in has_children]
-            # Safety fallback for pathological inputs
             return class_names or [c["name"] for c in categories]
 
-        # list all YAML files in the folder
         if is_valid_yolo_dataset(dataset_dir):
-            yaml_paths = glob.glob(os.path.join(dataset_dir, "*.yaml")) + glob.glob(os.path.join(dataset_dir, "*.yml"))
-            # any YAML file starting with data e.g. data.yaml, dataset.yaml
-            yaml_data_files = [yp for yp in yaml_paths if os.path.basename(yp).startswith("data")]
+            yaml_data_files = [
+                os.path.join(dataset_dir, entry)
+                for entry in os.listdir(dataset_dir)
+                if (entry.endswith(".yaml") or entry.endswith(".yml")) and entry.startswith("data")
+            ]
+            yaml_data_files.sort()
+            if not yaml_data_files:
+                raise FileNotFoundError(
+                    f"Could not find YOLO data yaml in {dataset_dir}. Expected files like data.yaml or data.yml."
+                )
             yaml_path = yaml_data_files[0]
             with open(yaml_path, "r") as f:
                 data = yaml.safe_load(f)
@@ -275,6 +275,35 @@ class RFDETR:
             f"Could not find class names in {dataset_dir}. "
             "Checked for COCO (train/_annotations.coco.json) and YOLO (data.yaml, data.yml) styles."
         )
+
+    @staticmethod
+    def _load_classes(dataset_dir: Union[str, List[str]]) -> List[str]:
+        """Load and validate class names from one or more dataset directories.
+
+        When multiple directories are provided, all must contain the exact
+        same set of class names (order and content).  A ``ValueError`` is
+        raised if any mismatch is detected.
+        """
+        if isinstance(dataset_dir, str):
+            return RFDETR._load_classes_single(dataset_dir)
+
+        dirs = list(dataset_dir)
+        if not dirs:
+            raise ValueError("dataset_dir list must not be empty")
+
+        reference_classes = RFDETR._load_classes_single(dirs[0])
+
+        for d in dirs[1:]:
+            other_classes = RFDETR._load_classes_single(d)
+            if other_classes != reference_classes:
+                raise ValueError(
+                    f"Class name mismatch across dataset directories.\n"
+                    f"  Directory '{dirs[0]}' has classes: {reference_classes}\n"
+                    f"  Directory '{d}' has classes: {other_classes}\n"
+                    f"All dataset directories must contain the exact same class names."
+                )
+
+        return reference_classes
 
     def train_from_config(self, config: TrainConfig, **kwargs):
         if config.dataset_file == "roboflow":

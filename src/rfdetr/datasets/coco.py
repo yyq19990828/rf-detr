@@ -19,6 +19,9 @@ COCO dataset which returns image_id for evaluation.
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 """
 
+import hashlib
+import pickle
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -27,17 +30,135 @@ import torch
 import torch.utils.data
 import torchvision
 from PIL import Image
+from pycocotools.coco import COCO
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
 from rfdetr.datasets.aug_config import AUG_CONFIG
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
 from rfdetr.util.logger import get_logger
+from rfdetr.util.misc import get_rank, is_dist_avail_and_initialized
 
 logger = get_logger()
+
+_CACHE_VERSION = 1
 
 
 def is_valid_coco_dataset(dataset_dir: str) -> bool:
     return (Path(dataset_dir) / "train" / "_annotations.coco.json").exists()
+
+
+def _hash_file(file_path: Union[str, Path]) -> str:
+    """Compute the SHA256 digest of a file's content.
+
+    Args:
+        file_path: Path to the file that should be hashed.
+
+    Returns:
+        Hex-encoded SHA256 digest of the file bytes.
+    """
+    path = Path(file_path)
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _build_coco_from_cache(cache: Dict[str, Any]) -> COCO:
+    """Reconstruct a ``pycocotools.coco.COCO`` object from cached state.
+
+    Args:
+        cache: Cached COCO internals loaded from a pickle file.
+
+    Returns:
+        A reconstructed :class:`pycocotools.coco.COCO` object.
+    """
+    coco = COCO()
+    coco.dataset = cache["dataset"]
+    coco.anns = cache["anns"]
+    coco.cats = cache["cats"]
+    coco.imgs = cache["imgs"]
+    coco.imgToAnns = cache["imgToAnns"]
+    coco.catToImgs = cache["catToImgs"]
+    return coco
+
+
+def load_coco_cached(ann_file: Union[str, Path]) -> COCO:
+    """Load COCO annotations with DDP-safe ``.coco_cache`` support.
+
+    This mirrors the YOLO cache pattern: all processes attempt to read cache,
+    rank 0 regenerates stale/missing cache, and non-zero ranks wait for the
+    rank 0 cache artifact.
+
+    Args:
+        ann_file: Path to the COCO annotation JSON file.
+
+    Returns:
+        Parsed :class:`pycocotools.coco.COCO` object loaded from cache or JSON.
+    """
+    ann_path = Path(ann_file)
+    cache_path = ann_path.parent / ".coco_cache"
+    current_hash = _hash_file(ann_path)
+
+    def _load_if_fresh() -> Optional[COCO]:
+        if not cache_path.exists():
+            return None
+        try:
+            cache_data = pickle.loads(cache_path.read_bytes())
+            if cache_data.get("version") == _CACHE_VERSION and cache_data.get("hash") == current_hash:
+                logger.info("Loaded COCO annotations from cache %s", cache_path)
+                return _build_coco_from_cache(cache_data)
+            logger.info("COCO cache %s is stale, regenerating...", cache_path)
+        except Exception:
+            logger.warning("Failed to load COCO cache %s, regenerating...", cache_path)
+        return None
+
+    cached = _load_if_fresh()
+    if cached is not None:
+        return cached
+
+    rank = get_rank()
+    is_distributed = is_dist_avail_and_initialized()
+    if is_distributed and rank != 0:
+        logger.info("Rank %d waiting for rank 0 to build COCO cache %s ...", rank, cache_path)
+        for _wait in range(3600):
+            time.sleep(1)
+            cached = _load_if_fresh()
+            if cached is not None:
+                return cached
+        raise RuntimeError(f"Rank {rank}: timed out waiting for rank 0 to write cache {cache_path}")
+
+    coco = COCO(str(ann_path))
+    cache_data = {
+        "version": _CACHE_VERSION,
+        "hash": current_hash,
+        "dataset": coco.dataset,
+        "anns": coco.anns,
+        "cats": coco.cats,
+        "imgs": coco.imgs,
+        "imgToAnns": coco.imgToAnns,
+        "catToImgs": coco.catToImgs,
+    }
+
+    try:
+        cache_path.write_bytes(pickle.dumps(cache_data))
+        logger.info("Saved COCO cache -> %s", cache_path)
+    except OSError:
+        logger.warning("Could not write COCO cache file %s", cache_path)
+
+    return coco
+
+
+def load_coco_annotations_cached(ann_file: Union[str, Path]) -> COCO:
+    """Backward-compatible helper that delegates to ``load_coco_cached``.
+
+    Args:
+        ann_file: Path to the COCO annotation JSON file.
+
+    Returns:
+        Parsed :class:`pycocotools.coco.COCO` object.
+    """
+    return load_coco_cached(ann_file)
 
 
 def compute_multi_scale_scales(
@@ -127,8 +248,14 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         transforms: Optional[Any],
         include_masks: bool = False,
         remap_category_ids: bool = False,
+        use_cache: bool = False,
     ) -> None:
-        super(CocoDetection, self).__init__(img_folder, ann_file)
+        if use_cache:
+            torchvision.datasets.VisionDataset.__init__(self, img_folder)
+            self.coco = load_coco_cached(ann_file)
+            self.ids = list(sorted(self.coco.imgs.keys()))
+        else:
+            super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.include_masks = include_masks
         if remap_category_ids:
@@ -144,15 +271,40 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
-        img, target = super(CocoDetection, self).__getitem__(idx)
-        image_id = self.ids[idx]
-        target = {"image_id": image_id, "annotations": target}
-        img, target = self.prepare(img, target)
-        if self._transforms is not None:
-            img, target = self._transforms(
-                img, target
-            )  # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to normalized [cx, cy, w, h] occurs inside Normalize
-        return img, target
+        """Load a single sample, skipping corrupt images gracefully.
+
+        If an image cannot be read (e.g. truncated file on disk), the method
+        retries with a random replacement index.  This mirrors the behaviour
+        of Ultralytics YOLO, ensuring that a handful of broken files on a
+        mechanical drive never crash a long training run.
+
+        Args:
+            idx: Sample index.
+
+        Returns:
+            A ``(image, target)`` tuple suitable for the training pipeline.
+        """
+        import random
+
+        for _attempt in range(10):
+            try:
+                img, target = super(CocoDetection, self).__getitem__(idx)
+                image_id = self.ids[idx]
+                target = {"image_id": image_id, "annotations": target}
+                img, target = self.prepare(img, target)
+                if self._transforms is not None:
+                    img, target = self._transforms(
+                        img, target
+                    )  # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to normalized [cx, cy, w, h] occurs inside Normalize
+                return img, target
+            except Exception:
+                logger.warning(
+                    "Skipping corrupt image idx=%d, retrying with random replacement",
+                    idx,
+                )
+                idx = random.randint(0, len(self.ids) - 1)
+
+        raise RuntimeError("Failed to load a valid sample after 10 attempts")
 
 
 class ConvertCoco(object):
@@ -583,6 +735,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             ),
             include_masks=include_masks,
             remap_category_ids=True,
+            use_cache=True,
         )
     else:
         logger.info(f"Building Roboflow {image_set} dataset at resolution {resolution}")
@@ -601,5 +754,6 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             ),
             include_masks=include_masks,
             remap_category_ids=True,
+            use_cache=True,
         )
     return dataset

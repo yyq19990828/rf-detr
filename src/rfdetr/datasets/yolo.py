@@ -4,7 +4,10 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
+import hashlib
 import os
+import pickle
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,10 @@ from rfdetr.datasets.coco import (
     make_coco_transforms,
     make_coco_transforms_square_div_64,
 )
+from rfdetr.util.logger import get_logger
+
+logger = get_logger()
+
 
 REQUIRED_YOLO_YAML_FILES = ["data.yaml", "data.yml"]
 REQUIRED_SPLIT_DIRS = ["train", "valid"]
@@ -49,12 +56,358 @@ def is_valid_yolo_dataset(dataset_dir: str) -> bool:
     return contains_required_yolo_yaml and contains_required_split_dirs and contains_required_data_subdirs
 
 
+# ---------------------------------------------------------------------------
+# Image file extensions recognised by the YOLO loader (same as supervision)
+# ---------------------------------------------------------------------------
+_IMAGE_EXTENSIONS = frozenset({".bmp", ".dng", ".jpg", ".jpeg", ".mpo", ".png", ".tif", ".tiff", ".webp"})
+
+# Cache format version – bump when the on-disk layout changes so that stale
+# caches are automatically regenerated.
+_CACHE_VERSION = 4
+
+
+def _hash_directory(directory: str, extensions: frozenset[str]) -> str:
+    """Return a fast hash summarising the file listing of *directory*.
+
+    The hash is built from sorted file names and their ``os.stat`` results
+    (size + mtime) so that any addition, removal or modification of image /
+    label files invalidates the cache.
+
+    Args:
+        directory: Path to directory to hash.
+        extensions: Set of lowercase file extensions (with leading dot) to
+            include.  Pass ``None`` to include **all** files.
+
+    Returns:
+        A hex-digest string representing the directory state.
+    """
+    h = hashlib.sha256()
+    try:
+        entries = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return ""
+    for name in entries:
+        if extensions and os.path.splitext(name)[1].lower() not in extensions:
+            continue
+        full = os.path.join(directory, name)
+        try:
+            st = os.stat(full)
+            h.update(f"{name},{st.st_size},{st.st_mtime_ns}".encode())
+        except OSError:
+            h.update(name.encode())
+    return h.hexdigest()
+
+
+def _list_image_paths(images_directory: str) -> list[str]:
+    """List image file paths in *images_directory*, sorted for determinism.
+
+    Args:
+        images_directory: Path to directory containing image files.
+
+    Returns:
+        Sorted list of absolute image file paths.
+    """
+    paths: list[str] = []
+    for name in sorted(os.listdir(images_directory)):
+        if os.path.splitext(name)[1].lower() in _IMAGE_EXTENSIONS:
+            paths.append(os.path.join(images_directory, name))
+    return paths
+
+
+def _parse_yolo_label_line(line: str) -> tuple[int, list[str]] | None:
+    """Parse a single YOLO label line, skipping invalid entries.
+
+    Returns ``(class_id, remaining_values)`` on success, or ``None`` if the
+    line should be skipped (e.g. non-numeric class ID).
+
+    Args:
+        line: A single line from a YOLO ``.txt`` annotation file.
+
+    Returns:
+        Tuple of (class_id, value_strings) or ``None`` when invalid.
+    """
+    parts = line.strip().split()
+    if len(parts) < 5:
+        return None
+    try:
+        class_id = int(parts[0])
+    except ValueError:
+        # Non-numeric class ID (e.g. "slagcar") – skip with warning
+        return None
+    return class_id, parts[1:]
+
+
+def _parse_yolo_annotations(
+    lines: list[str],
+    resolution_wh: tuple[int, int],
+    force_masks: bool = False,
+) -> tuple[sv.Detections, int]:
+    """Parse YOLO annotation lines into a supervision ``Detections`` object.
+
+    Invalid lines (non-numeric class IDs, too few values, etc.) are silently
+    skipped and counted.
+
+    Args:
+        lines: Raw lines from a YOLO ``.txt`` annotation file.
+        resolution_wh: ``(width, height)`` of the corresponding image.
+        force_masks: Whether to generate mask arrays from polygon
+            annotations.
+
+    Returns:
+        A tuple of ``(detections, n_skipped)`` where *n_skipped* is the
+        number of lines that were ignored.
+    """
+    if not lines:
+        return sv.Detections.empty(), 0
+
+    w, h = resolution_wh
+    class_ids: list[int] = []
+    relative_xyxy: list[np.ndarray] = []
+    relative_polygons: list[np.ndarray] = []
+    n_skipped = 0
+
+    # Determine if any line has polygon-style annotations (> 5 values)
+    with_masks = force_masks or any(len(ln.split()) > 5 for ln in lines)
+
+    for line in lines:
+        parsed = _parse_yolo_label_line(line)
+        if parsed is None:
+            n_skipped += 1
+            continue
+        cid, values = parsed
+
+        if len(values) == 4:
+            # Standard bounding box: x_center y_center width height
+            xc, yc, bw, bh = (float(v) for v in values)
+            box = np.array(
+                [xc - bw / 2, yc - bh / 2, xc + bw / 2, yc + bh / 2],
+                dtype=np.float32,
+            )
+            relative_xyxy.append(box)
+            if with_masks:
+                relative_polygons.append(
+                    np.array(
+                        [[box[0], box[1]], [box[2], box[1]], [box[2], box[3]], [box[0], box[3]]],
+                        dtype=np.float32,
+                    )
+                )
+        elif len(values) >= 6 and len(values) % 2 == 0:
+            # Polygon / segmentation annotation
+            polygon = np.array([float(v) for v in values], dtype=np.float32).reshape(-1, 2)
+            xs, ys = polygon[:, 0], polygon[:, 1]
+            box = np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32)
+            relative_xyxy.append(box)
+            if with_masks:
+                relative_polygons.append(polygon)
+        else:
+            n_skipped += 1
+            continue
+
+        class_ids.append(cid)
+
+    if not class_ids:
+        return sv.Detections.empty(), n_skipped
+
+    class_id_arr = np.array(class_ids, dtype=int)
+    xyxy_arr = np.array(relative_xyxy, dtype=np.float32)
+    xyxy_arr *= np.array([w, h, w, h], dtype=np.float32)
+
+    if not with_masks:
+        return sv.Detections(class_id=class_id_arr, xyxy=xyxy_arr), n_skipped
+
+    from supervision.detection.utils.converters import polygon_to_mask
+
+    abs_polygons = [(p * np.array([w, h], dtype=np.float32)).astype(int) for p in relative_polygons]
+    masks = np.array(
+        [polygon_to_mask(polygon=p, resolution_wh=(w, h)) for p in abs_polygons],
+        dtype=bool,
+    )
+    return (
+        sv.Detections(class_id=class_id_arr, xyxy=xyxy_arr, mask=masks),
+        n_skipped,
+    )
+
+
+def load_yolo_annotations_cached(
+    images_directory_path: str,
+    annotations_directory_path: str,
+    data_yaml_path: str,
+    force_masks: bool = False,
+) -> tuple[sv.DetectionDataset, dict[str, tuple[int, int]]]:
+    """Load a YOLO dataset with ``.cache`` file support.
+
+    On first invocation the function scans every image (for dimensions) and
+    every label file, then writes a ``.cache`` pickle next to the labels
+    directory.  Subsequent calls with the **same** file listing load
+    instantly from cache.
+
+    Invalid label lines (non-numeric class IDs, malformed values) are
+    automatically skipped and a summary warning is emitted.
+
+    Args:
+        images_directory_path: Path to the directory containing images.
+        annotations_directory_path: Path to the directory containing YOLO
+            ``.txt`` annotation files.
+        data_yaml_path: Path to ``data.yaml`` with class name definitions.
+        force_masks: If ``True``, load / generate segmentation masks for
+            every annotation.
+
+    Returns:
+        A tuple of:
+        - A :class:`supervision.DetectionDataset` instance.
+        - A dict mapping image path to ``(width, height)`` in pixels.
+    """
+    from tqdm.auto import tqdm
+
+    from rfdetr.util.misc import get_rank, is_dist_avail_and_initialized
+
+    rank = get_rank()
+    is_distributed = is_dist_avail_and_initialized()
+
+    # ---- Determine cache path (inside labels dir as .cache) ----
+    labels_dir = Path(annotations_directory_path)
+    cache_path = labels_dir / ".cache"
+
+    # ---- Compute directory hashes for freshness check --------------------
+    img_hash = _hash_directory(images_directory_path, _IMAGE_EXTENSIONS)
+    lbl_hash = _hash_directory(annotations_directory_path, frozenset({".txt"}))
+    current_hash = f"v{_CACHE_VERSION}:{img_hash}:{lbl_hash}"
+
+    # ---- Helper: deserialise a validated cache dict -----------------------
+    def _load_from_cache_data(
+        cache: dict,
+    ) -> tuple[sv.DetectionDataset, dict[str, tuple[int, int]]]:
+        classes_c = cache["classes"]
+        image_paths_c = cache["image_paths"]
+        annotations_c = {ip: sv.Detections(**det_kwargs) for ip, det_kwargs in cache["annotations"].items()}
+        logger.info("Loaded %d images from cache %s", len(image_paths_c), cache_path)
+        return (
+            sv.DetectionDataset(
+                classes=classes_c,
+                images=image_paths_c,
+                annotations=annotations_c,
+            ),
+            {},
+        )
+
+    # ---- Try loading from cache (all ranks) ------------------------------
+    if cache_path.exists():
+        try:
+            cache = pickle.loads(cache_path.read_bytes())
+            if cache.get("hash") == current_hash:
+                return _load_from_cache_data(cache)
+            logger.info("Cache %s is stale, regenerating…", cache_path)
+        except Exception:
+            logger.warning("Failed to load cache %s, regenerating…", cache_path)
+
+    # ---- DDP: only rank 0 performs the full scan -------------------------
+    if is_distributed and rank != 0:
+        logger.info("Rank %d waiting for rank 0 to build cache %s …", rank, cache_path)
+        for _wait in range(3600):
+            time.sleep(1)
+            if cache_path.exists():
+                try:
+                    cache = pickle.loads(cache_path.read_bytes())
+                    if cache.get("hash") == current_hash:
+                        return _load_from_cache_data(cache)
+                except Exception:
+                    pass
+        raise RuntimeError(f"Rank {rank}: timed out waiting for rank 0 to write cache {cache_path}")
+
+    # ---- Full scan (rank 0 or single-process) ----------------------------
+    from supervision.utils.file import read_yaml_file
+
+    data = read_yaml_file(file_path=data_yaml_path)
+    names = data["names"]
+    if isinstance(names, dict):
+        classes = [names[key] for key in sorted(names.keys())]
+    else:
+        classes = list(names)
+
+    image_paths = _list_image_paths(images_directory_path)
+    annotations: dict[str, sv.Detections] = {}
+    total_skipped = 0
+
+    start_t = time.perf_counter()
+    for image_path in tqdm(image_paths, desc=f"Scanning {labels_dir.name}", unit="img"):
+        stem = Path(image_path).stem
+        annotation_path = os.path.join(annotations_directory_path, f"{stem}.txt")
+
+        if not os.path.exists(annotation_path):
+            annotations[image_path] = sv.Detections.empty()
+            continue
+
+        if force_masks:
+            try:
+                with Image.open(image_path) as img:
+                    w, h = img.size
+            except Exception:
+                continue
+            res_wh: tuple[int, int] = (w, h)
+        else:
+            res_wh = (1, 1)
+
+        with open(annotation_path, "r") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+
+        det, n_skip = _parse_yolo_annotations(lines, resolution_wh=res_wh, force_masks=force_masks)
+        annotations[image_path] = det
+        total_skipped += n_skip
+
+    elapsed = time.perf_counter() - start_t
+
+    valid_image_paths = list(annotations.keys())
+
+    logger.info(
+        "Scanned %d images (%d valid) in %.1fs (%s)",
+        len(image_paths),
+        len(valid_image_paths),
+        elapsed,
+        labels_dir.name,
+    )
+    if total_skipped > 0:
+        logger.warning(
+            "Skipped %d invalid label lines in %s (non-numeric class ID or malformed)",
+            total_skipped,
+            labels_dir.name,
+        )
+
+    # ---- Serialise annotations for pickle --------------------------------
+    serialisable_annotations = {}
+    for ip, det in annotations.items():
+        kwargs: dict[str, Any] = {"xyxy": det.xyxy, "class_id": det.class_id}
+        if det.mask is not None:
+            kwargs["mask"] = det.mask
+        serialisable_annotations[ip] = kwargs
+
+    cache_data = {
+        "hash": current_hash,
+        "classes": classes,
+        "image_paths": valid_image_paths,
+        "annotations": serialisable_annotations,
+    }
+
+    try:
+        cache_path.write_bytes(pickle.dumps(cache_data))
+        logger.info("Saved cache → %s", cache_path)
+    except OSError:
+        logger.warning("Could not write cache file %s", cache_path)
+
+    return (
+        sv.DetectionDataset(classes=classes, images=valid_image_paths, annotations=annotations),
+        {},
+    )
+
+
 class ConvertYolo:
     """
     Converts supervision Detections to the target dict format expected by RF-DETR.
 
     Args:
         include_masks: whether to include segmentation masks
+        normalized_coords: when ``True``, ``detections.xyxy`` values are in
+            [0, 1] range and will be scaled to pixel coordinates using the
+            actual image dimensions at call time.
 
     Examples:
         >>> import numpy as np
@@ -81,8 +434,9 @@ class ConvertYolo:
         [0]
     """
 
-    def __init__(self, include_masks: bool = False):
+    def __init__(self, include_masks: bool = False, normalized_coords: bool = False):
         self.include_masks = include_masks
+        self.normalized_coords = normalized_coords
 
     def __call__(self, image: Image.Image, target: dict) -> tuple:
         """
@@ -105,6 +459,10 @@ class ConvertYolo:
         if len(detections) > 0:
             boxes = torch.from_numpy(detections.xyxy).to(torch.float32)
             classes = torch.from_numpy(detections.class_id).to(torch.int64)
+
+            if self.normalized_coords:
+                boxes[:, 0::2] *= w
+                boxes[:, 1::2] *= h
         else:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             classes = torch.zeros((0,), dtype=torch.int64)
@@ -149,15 +507,18 @@ class _MockSvDataset:
 
     classes = ["cat", "dog"]
 
-    def __len__(self):
-        return 2
-
-    def __getitem__(self, i):
+    def __init__(self):
         import numpy as np
         import supervision as sv
 
-        det = sv.Detections(xyxy=np.array([[10 * i, 20, 30, 40]]), class_id=np.array([i]))
-        return f"img_{i}.jpg", np.zeros((100, 100, 3), dtype=np.uint8), det
+        self.image_paths = ["img_0.jpg", "img_1.jpg"]
+        self.annotations = {
+            "img_0.jpg": sv.Detections(xyxy=np.array([[0, 20, 30, 40]]), class_id=np.array([0])),
+            "img_1.jpg": sv.Detections(xyxy=np.array([[10, 20, 30, 40]]), class_id=np.array([1])),
+        }
+
+    def __len__(self):
+        return 2
 
 
 class CocoLikeAPI:
@@ -169,7 +530,8 @@ class CocoLikeAPI:
 
     Examples:
         >>> mock = _MockSvDataset()
-        >>> coco = CocoLikeAPI(mock.classes, mock)
+        >>> sizes = {"img_0.jpg": (100, 100), "img_1.jpg": (100, 100)}
+        >>> coco = CocoLikeAPI(mock.classes, mock, sizes)
         >>> # dataset structure
         >>> len(coco.dataset["images"]), len(coco.dataset["categories"]), len(coco.dataset["annotations"])
         (2, 2, 2)
@@ -204,31 +566,33 @@ class CocoLikeAPI:
         'img_1.jpg'
     """
 
-    def __init__(self, classes: list, dataset: sv.DetectionDataset):
+    def __init__(
+        self,
+        classes: list,
+        dataset: sv.DetectionDataset,
+        image_sizes: dict[str, tuple[int, int]],
+    ):
         self.classes = classes
         self.sv_dataset = dataset
+        self.image_sizes = image_sizes
 
-        # Build the dataset dict that COCO API expects
         self.dataset = self._build_coco_dataset()
         self.imgs = {img["id"]: img for img in self.dataset["images"]}
         self.anns = {ann["id"]: ann for ann in self.dataset["annotations"]}
         self.cats = {cat["id"]: cat for cat in self.dataset["categories"]}
 
-        # Build imgToAnns index
-        self.imgToAnns = {}
+        self.imgToAnns: dict[int, list] = {}
         for ann in self.dataset["annotations"]:
             img_id = ann["image_id"]
             if img_id not in self.imgToAnns:
                 self.imgToAnns[img_id] = []
             self.imgToAnns[img_id].append(ann)
 
-        # Ensure all images have an entry
         for img_id in self.imgs:
             if img_id not in self.imgToAnns:
                 self.imgToAnns[img_id] = []
 
-        # Build catToImgs index
-        self.catToImgs = {}
+        self.catToImgs: dict[int, list] = {}
         for cat_id in self.cats:
             self.catToImgs[cat_id] = []
         for ann in self.dataset["annotations"]:
@@ -238,19 +602,18 @@ class CocoLikeAPI:
                 self.catToImgs[cat_id].append(img_id)
 
     def _build_coco_dataset(self) -> dict:
-        """Build a COCO-format dataset dict from YOLO data."""
+        """Build a COCO-format dataset dict from cached annotations + sizes."""
         images = []
         annotations = []
         categories = []
 
-        # Build categories (0-indexed class IDs in YOLO)
         for idx, class_name in enumerate(self.classes):
             categories.append({"id": idx, "name": class_name, "supercategory": "none"})
 
         ann_id = 0
-        for img_id in range(len(self.sv_dataset)):
-            image_path, cv2_image, detections = self.sv_dataset[img_id]
-            h, w = cv2_image.shape[:2]
+        for img_id, image_path in enumerate(self.sv_dataset.image_paths):
+            detections = self.sv_dataset.annotations[image_path]
+            w, h = self.image_sizes.get(image_path, (0, 0))
 
             images.append({"id": img_id, "file_name": str(image_path), "height": h, "width": w})
 
@@ -259,7 +622,7 @@ class CocoLikeAPI:
             for i in range(len(detections)):
                 bbox_x, bbox_y, bbox_w, bbox_h = sv.xyxy_to_xywh(detections.xyxy[i : i + 1])[0]
 
-                ann = {
+                ann: dict[str, Any] = {
                     "id": ann_id,
                     "image_id": img_id,
                     "category_id": int(detections.class_id[i]),
@@ -268,9 +631,7 @@ class CocoLikeAPI:
                     "iscrowd": 0,
                 }
 
-                # Add segmentation if available
                 if detections.mask is not None:
-                    # For now, use empty polygon - evaluation will still work for bbox
                     ann["segmentation"] = []
 
                 annotations.append(ann)
@@ -413,18 +774,26 @@ class CocoLikeAPI:
 
 
 class YoloDetection(VisionDataset):
-    """
-    YOLO format dataset using supervision.DetectionDataset.from_yolo().
+    """YOLO format dataset with ``.cache`` file support for fast loading.
 
-    This class provides a VisionDataset interface compatible with RF-DETR training,
-    matching the API of CocoDetection.
+    On the first run the dataset scans all images and labels, then writes a
+    ``.cache`` pickle next to the labels directory.  Subsequent
+    instantiations with the same data load from cache almost instantly.
+
+    Invalid label lines (non-numeric class IDs, malformed values) are
+    automatically skipped and a summary warning is emitted.
+
+    This class provides a VisionDataset interface compatible with RF-DETR
+    training, matching the API of CocoDetection.
 
     Args:
-        img_folder: Path to the directory containing images
-        lb_folder: Path to the directory containing YOLO annotation .txt files
-        data_file: Path to data.yaml file containing class names and dataset info
-        transforms: Optional transforms to apply to images and targets
-        include_masks: Whether to load segmentation masks (for YOLO segmentation format)
+        img_folder: Path to the directory containing images.
+        lb_folder: Path to the directory containing YOLO annotation ``.txt``
+            files.
+        data_file: Path to ``data.yaml`` file containing class names.
+        transforms: Optional transforms to apply to images and targets.
+        include_masks: Whether to load segmentation masks (for YOLO
+            segmentation format).
     """
 
     def __init__(
@@ -432,16 +801,15 @@ class YoloDetection(VisionDataset):
         img_folder: str,
         lb_folder: str,
         data_file: str,
-        transforms=None,
+        transforms: Any = None,
         include_masks: bool = False,
     ):
         super(YoloDetection, self).__init__(img_folder)
         self._transforms = transforms
         self.include_masks = include_masks
-        self.prepare = ConvertYolo(include_masks=include_masks)
+        self.prepare = ConvertYolo(include_masks=include_masks, normalized_coords=not include_masks)
 
-        # Load dataset using supervision's from_yolo method
-        self.sv_dataset = sv.DetectionDataset.from_yolo(
+        self.sv_dataset, self._image_sizes = load_yolo_annotations_cached(
             images_directory_path=img_folder,
             annotations_directory_path=lb_folder,
             data_yaml_path=data_file,
@@ -451,27 +819,54 @@ class YoloDetection(VisionDataset):
         self.classes = self.sv_dataset.classes
         self.ids = list(range(len(self.sv_dataset)))
 
-        # Create COCO-compatible API for evaluation
-        self.coco = CocoLikeAPI(self.classes, self.sv_dataset)
+        self.coco = CocoLikeAPI(self.classes, self.sv_dataset, self._image_sizes)
 
     def __len__(self) -> int:
         return len(self.sv_dataset)
 
     def __getitem__(self, idx: int):
-        image_id = self.ids[idx]
-        image_path, cv2_image, detections = self.sv_dataset[idx]
+        """Load a single sample, skipping corrupt images gracefully.
 
-        # Convert BGR (OpenCV) to RGB (PIL)
-        rgb_image = cv2_image[:, :, ::-1]
-        img = Image.fromarray(rgb_image)
+        If an image cannot be read (e.g. truncated file on disk), the method
+        retries with a random replacement index.  This mirrors the behaviour
+        of Ultralytics YOLO, ensuring that a handful of broken files on a
+        mechanical drive never crash a long training run.
 
-        target = {"image_id": image_id, "detections": detections}
-        img, target = self.prepare(img, target)
+        Args:
+            idx: Sample index.
 
-        if self._transforms is not None:
-            img, target = self._transforms(img, target)
+        Returns:
+            A ``(image, target)`` tuple suitable for the training pipeline.
+        """
+        import random
 
-        return img, target
+        for _attempt in range(10):
+            try:
+                image_id = self.ids[idx]
+                image_path, cv2_image, detections = self.sv_dataset[idx]
+
+                if cv2_image is None:
+                    raise ValueError(f"cv2.imread returned None for {image_path}")
+
+                # Convert BGR (OpenCV) to RGB (PIL)
+                rgb_image = cv2_image[:, :, ::-1]
+                img = Image.fromarray(rgb_image)
+
+                target = {"image_id": image_id, "detections": detections}
+                img, target = self.prepare(img, target)
+
+                if self._transforms is not None:
+                    img, target = self._transforms(img, target)
+
+                return img, target
+            except Exception:
+                logger.warning(
+                    "Skipping corrupt image idx=%d, retrying with random replacement",
+                    idx,
+                )
+                idx = random.randint(0, len(self.sv_dataset) - 1)
+
+        raise RuntimeError("Failed to load a valid sample after 10 attempts")
 
 
 def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> YoloDetection:

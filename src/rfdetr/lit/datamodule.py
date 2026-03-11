@@ -97,6 +97,13 @@ class RFDETRDataModule(LightningDataModule):
         if stage == "fit":
             if self._dataset_train is None:
                 self._dataset_train = build_dataset("train", args, args.resolution)
+                if self.train_config.run_eda:
+                    from rfdetr.util.misc import get_rank
+
+                    if get_rank() == 0:
+                        from rfdetr.datasets.eda import run_eda
+
+                        run_eda(self._dataset_train, self.train_config.output_dir, split="train")
             if self._dataset_val is None:
                 self._dataset_val = build_dataset("val", args, args.resolution)
         elif stage == "validate":
@@ -202,6 +209,15 @@ class RFDETRDataModule(LightningDataModule):
     # Properties
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _get_coco_from_dataset(dataset: torch.utils.data.Dataset) -> Optional[Any]:
+        """Extract the COCO API object from a dataset, handling ConcatDataset."""
+        if isinstance(dataset, torch.utils.data.ConcatDataset):
+            if dataset.datasets:
+                return RFDETRDataModule._get_coco_from_dataset(dataset.datasets[0])
+            return None
+        return getattr(dataset, "coco", None)
+
     @property
     def class_names(self) -> Optional[List[str]]:
         """Class names from the training or validation dataset annotation file.
@@ -216,7 +232,7 @@ class RFDETRDataModule(LightningDataModule):
         for dataset in (self._dataset_train, self._dataset_val):
             if dataset is None:
                 continue
-            coco = getattr(dataset, "coco", None)
+            coco = self._get_coco_from_dataset(dataset)
             if coco is not None and hasattr(coco, "cats"):
                 return [coco.cats[k]["name"] for k in sorted(coco.cats.keys())]
         return None

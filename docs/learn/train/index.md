@@ -69,6 +69,7 @@ RF-DETR provides many configuration options to customize your training run. See 
 
 - [Resume training](advanced.md#resume-training) from a checkpoint
 - [Early stopping](advanced.md#early-stopping) to prevent overfitting
+- [Multi-directory training](advanced.md#multi-directory-training) to combine multiple datasets
 - [Multi-GPU training](advanced.md#multi-gpu-training) with PyTorch DDP
 - [Custom augmentations with Albumentations](augmentations.md) - Dedicated guide
 - [Memory optimization](advanced.md#memory-optimization) with gradient checkpointing

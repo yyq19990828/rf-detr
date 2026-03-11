@@ -138,6 +138,105 @@ Epoch 22: mAP = 0.452 (best: 0.455) - counter: 10 → STOP
 
 ---
 
+## Multi-Directory Training
+
+You can train on multiple dataset directories at once by passing a list of paths to `dataset_dir`. This is useful when you have the same classes annotated across separate data sources (e.g. different collection sessions, different annotation batches, or datasets downloaded from different Roboflow projects) and want to combine them into a single training run without manually merging files.
+
+### Basic Usage
+
+=== "Object Detection"
+
+    ```python
+    from rfdetr import RFDETRMedium
+
+    model = RFDETRMedium()
+
+    model.train(
+        dataset_dir=[
+            "path/to/dataset_a",
+            "path/to/dataset_b",
+            "path/to/dataset_c",
+        ],
+        epochs=100,
+        batch_size=4,
+        grad_accum_steps=4,
+    )
+    ```
+
+=== "Image Segmentation"
+
+    ```python
+    from rfdetr import RFDETRSegMedium
+
+    model = RFDETRSegMedium()
+
+    model.train(
+        dataset_dir=[
+            "path/to/dataset_a",
+            "path/to/dataset_b",
+        ],
+        epochs=100,
+        batch_size=4,
+        grad_accum_steps=4,
+    )
+    ```
+
+### How It Works
+
+Each directory is loaded independently and then merged using PyTorch's `ConcatDataset`. The `train`, `valid`, and `test` splits from every directory are each concatenated together:
+
+```
+dataset_a/train/ + dataset_b/train/ + dataset_c/train/  → merged training set
+dataset_a/valid/ + dataset_b/valid/ + dataset_c/valid/  → merged validation set
+dataset_a/test/  + dataset_b/test/  + dataset_c/test/   → merged test set
+```
+
+### Requirements
+
+!!! warning "Class names must be identical"
+
+    All directories must contain **exactly the same class names in the same order**. If there is any mismatch, training will raise a `ValueError` showing which directories differ:
+
+    ```
+    Class name mismatch across dataset directories.
+      Directory 'path/to/dataset_a' has classes: ['cat', 'dog']
+      Directory 'path/to/dataset_b' has classes: ['dog', 'cat']
+    All dataset directories must contain the exact same class names.
+    ```
+
+    If your datasets have different class orderings, re-export them from Roboflow or manually align the class lists before training.
+
+Each directory must follow the standard dataset structure (COCO or YOLO format). You can mix formats across directories — each one is auto-detected independently.
+
+### Directory Structure Example
+
+```
+project/
+├── dataset_a/          # COCO format
+│   ├── train/
+│   │   ├── _annotations.coco.json
+│   │   └── *.jpg
+│   ├── valid/
+│   └── test/
+├── dataset_b/          # YOLO format (can differ from dataset_a)
+│   ├── data.yaml
+│   ├── train/
+│   │   ├── images/
+│   │   └── labels/
+│   ├── valid/
+│   └── test/
+```
+
+!!! tip "Backward Compatible"
+
+    Passing a single string still works exactly as before — no changes needed for existing code:
+
+    ```python
+    model.train(dataset_dir="path/to/dataset")  # still works
+    ```
+
+---
+
 ## Multi-GPU Training
 
 You can fine-tune RF-DETR on multiple GPUs using PyTorch's Distributed Data Parallel (DDP). This splits the workload across GPUs for faster training.

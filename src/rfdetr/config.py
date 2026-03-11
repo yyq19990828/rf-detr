@@ -6,7 +6,7 @@
 
 
 import os
-from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -309,7 +309,7 @@ class TrainConfig(BaseModel):
     num_select: int = 300
     dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
     square_resize_div_64: bool = True
-    dataset_dir: str
+    dataset_dir: Union[str, List[str]]
     output_dir: str = "output"
     multi_scale: bool = True
     expanded_scales: bool = True
@@ -335,6 +335,7 @@ class TrainConfig(BaseModel):
     eval_max_dets: int = 500
     eval_interval: int = 1
     log_per_class_metrics: bool = True
+    save_val_predictions: bool = False
     aug_config: Optional[Dict[str, Any]] = None
     # Promoted from populate_args() — PTL migration (T4-2).
     # device is intentionally absent: PTL auto-detects accelerator via Trainer(accelerator="auto").
@@ -353,6 +354,16 @@ class TrainConfig(BaseModel):
     pin_memory: Optional[bool] = None
     persistent_workers: Optional[bool] = None
     prefetch_factor: Optional[int] = None
+    """Number of batches each DataLoader worker pre-loads ahead of time.
+
+    Defaults to ``None`` (PyTorch uses 2). Higher values (e.g. 4) can hide
+    I/O latency when training on network-attached or HDD storage, but each
+    extra prefetched batch consumes GPU-pinned memory proportional to
+    ``batch_size × image_resolution²``.  On machines with ≤16 GB GPU RAM,
+    keep the default or set to 2.  On 24+ GB GPUs with slow storage,
+    try 4 and monitor memory with ``nvidia-smi``.
+    """
+    run_eda: bool = False
 
     @field_validator("ema_update_interval", "eval_interval", mode="after")
     @classmethod
@@ -370,15 +381,22 @@ class TrainConfig(BaseModel):
             raise ValueError("prefetch_factor must be >= 1 when provided.")
         return v
 
-    @field_validator("dataset_dir", "output_dir", mode="after")
+    @field_validator("output_dir", mode="after")
     @classmethod
-    def expand_paths(cls, v: str) -> str:
-        """
-        Expand user paths (e.g., '~' or paths with separators) but leave simple filenames
-        (like 'rf-detr-base.pth') unchanged so they can match hosted model keys.
-        """
+    def expand_output_path(cls, v: str) -> str:
+        """Expand user paths for output_dir."""
         if v is None:
             return v
+        return os.path.realpath(os.path.expanduser(v))
+
+    @field_validator("dataset_dir", mode="after")
+    @classmethod
+    def expand_dataset_dir(cls, v: Union[str, List[str]]) -> Union[str, List[str]]:
+        """Expand user paths for dataset_dir (single path or list of paths)."""
+        if v is None:
+            return v
+        if isinstance(v, list):
+            return [os.path.realpath(os.path.expanduser(p)) for p in v]
         return os.path.realpath(os.path.expanduser(v))
 
 

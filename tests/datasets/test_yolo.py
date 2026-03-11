@@ -22,7 +22,8 @@ class TestCocoLikeAPI:
     def coco_api(self):
         """Fixture to create a test instance of CocoLikeAPI."""
         mock = _MockSvDataset()
-        return CocoLikeAPI(mock.classes, mock)
+        sizes = {"img_0.jpg": (100, 100), "img_1.jpg": (100, 100)}
+        return CocoLikeAPI(mock.classes, mock, sizes)
 
     def test_initialization(self, coco_api):
         """Test that the API initializes correctly."""
@@ -237,11 +238,15 @@ class TestCocoLikeAPI:
         """Test handling of images with no annotations."""
 
         class EmptyMockDataset(_MockSvDataset):
-            def __getitem__(self, i):
-                det = sv.Detections(xyxy=np.empty((0, 4)), class_id=np.array([]))
-                return f"img_{i}.jpg", np.zeros((100, 100, 3), dtype=np.uint8), det
+            def __init__(self):
+                super().__init__()
+                self.image_paths = ["img_0.jpg"]
+                self.annotations = {
+                    "img_0.jpg": sv.Detections(xyxy=np.empty((0, 4)), class_id=np.array([])),
+                }
 
-        api = CocoLikeAPI(["cat"], EmptyMockDataset())
+        sizes = {"img_0.jpg": (100, 100)}
+        api = CocoLikeAPI(["cat"], EmptyMockDataset(), sizes)
         assert len(api.dataset["annotations"]) == 0
         assert len(api.getAnnIds()) == 0
 
@@ -249,14 +254,18 @@ class TestCocoLikeAPI:
         """Test handling of images with multiple annotations per image."""
 
         class MultiAnnotationMockDataset(_MockSvDataset):
-            def __getitem__(self, i):
-                if i == 0:
-                    det = sv.Detections(xyxy=np.array([[10, 20, 30, 40], [50, 60, 70, 80]]), class_id=np.array([0, 1]))
-                else:
-                    det = sv.Detections(xyxy=np.array([[15, 25, 35, 45]]), class_id=np.array([0]))
-                return f"img_{i}.jpg", np.zeros((100, 100, 3), dtype=np.uint8), det
+            def __init__(self):
+                super().__init__()
+                self.image_paths = ["img_0.jpg", "img_1.jpg"]
+                self.annotations = {
+                    "img_0.jpg": sv.Detections(
+                        xyxy=np.array([[10, 20, 30, 40], [50, 60, 70, 80]]), class_id=np.array([0, 1])
+                    ),
+                    "img_1.jpg": sv.Detections(xyxy=np.array([[15, 25, 35, 45]]), class_id=np.array([0])),
+                }
 
-        api = CocoLikeAPI(["cat", "dog"], MultiAnnotationMockDataset())
+        sizes = {"img_0.jpg": (100, 100), "img_1.jpg": (100, 100)}
+        api = CocoLikeAPI(["cat", "dog"], MultiAnnotationMockDataset(), sizes)
 
         # Verify 3 annotations in total
         assert len(api.dataset["annotations"]) == 3

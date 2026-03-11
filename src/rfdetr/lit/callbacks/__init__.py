@@ -9,10 +9,12 @@
 from rfdetr.lit.callbacks.best_model import BestModelCallback, RFDETREarlyStopping
 from rfdetr.lit.callbacks.drop_schedule import DropPathCallback
 from rfdetr.lit.callbacks.ema import RFDETREMACallback
+from rfdetr.lit.callbacks.val_visualizer import ValVisualizerCallback
 
 __all__ = [
     "BestModelCallback",
     "DropPathCallback",
     "RFDETREMACallback",
     "RFDETREarlyStopping",
+    "ValVisualizerCallback",
 ]

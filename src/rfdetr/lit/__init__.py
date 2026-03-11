@@ -28,6 +28,7 @@ from rfdetr.lit.callbacks import (
     DropPathCallback,
     RFDETREarlyStopping,
     RFDETREMACallback,
+    ValVisualizerCallback,
 )
 from rfdetr.lit.callbacks.coco_eval import COCOEvalCallback
 from rfdetr.lit.checkpoint import convert_legacy_checkpoint
@@ -127,6 +128,9 @@ def build_trainer(
             log_per_class_metrics=tc.log_per_class_metrics,
         )
     )
+
+    if tc.save_val_predictions:
+        callbacks.append(ValVisualizerCallback(output_dir=tc.output_dir, save_interval=tc.eval_interval, max_images=9))
 
     # Best-model checkpointing — monitor EMA metric only when EMA is active.
     callbacks.append(
