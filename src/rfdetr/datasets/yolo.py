@@ -658,21 +658,27 @@ class CocoLikeAPI:
 
             images.append({"id": img_id, "file_name": str(image_path), "height": h, "width": w})
 
-            if len(detections) == 0:
+            n_det = len(detections)
+            if n_det == 0:
                 continue
-            for i in range(len(detections)):
-                bbox_x, bbox_y, bbox_w, bbox_h = sv.xyxy_to_xywh(detections.xyxy[i : i + 1])[0]
+
+            # Batch-convert all boxes at once instead of per-annotation calls
+            xywh = sv.xyxy_to_xywh(detections.xyxy)
+            has_mask = detections.mask is not None
+
+            for i in range(n_det):
+                bx, by, bw, bh = xywh[i]
 
                 ann: dict[str, Any] = {
                     "id": ann_id,
                     "image_id": img_id,
                     "category_id": int(detections.class_id[i]),
-                    "bbox": [float(bbox_x), float(bbox_y), float(bbox_w), float(bbox_h)],
-                    "area": float(bbox_w * bbox_h),
+                    "bbox": [float(bx), float(by), float(bw), float(bh)],
+                    "area": float(bw * bh),
                     "iscrowd": 0,
                 }
 
-                if detections.mask is not None:
+                if has_mask:
                     ann["segmentation"] = []
 
                 annotations.append(ann)
@@ -850,6 +856,7 @@ class YoloDetection(VisionDataset):
         self.include_masks = include_masks
         self.prepare = ConvertYolo(include_masks=include_masks, normalized_coords=not include_masks)
 
+        logger.info("Loading YOLO annotations from %s …", img_folder)
         self.sv_dataset, self._image_sizes = load_yolo_annotations_cached(
             images_directory_path=img_folder,
             annotations_directory_path=lb_folder,
@@ -860,7 +867,10 @@ class YoloDetection(VisionDataset):
         self.classes = self.sv_dataset.classes
         self.ids = list(range(len(self.sv_dataset)))
 
+        logger.info("Building COCO-compatible index for %d images …", len(self.ids))
+        t0 = time.perf_counter()
         self.coco = CocoLikeAPI(self.classes, self.sv_dataset, self._image_sizes)
+        logger.info("COCO-compatible index built in %.2fs", time.perf_counter() - t0)
 
     def __len__(self) -> int:
         return len(self.sv_dataset)
@@ -954,6 +964,9 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
     num_windows = getattr(args, "num_windows", None)
     aug_config = getattr(args, "aug_config", None)
 
+    logger.info("Building '%s' dataset from %s …", image_set, img_folder)
+    t0 = time.perf_counter()
+
     if square_resize_div_64:
         dataset = YoloDetection(
             img_folder=str(img_folder),
@@ -988,4 +1001,11 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
             ),
             include_masks=include_masks,
         )
+
+    logger.info(
+        "Dataset '%s' ready: %d samples in %.2fs",
+        image_set,
+        len(dataset),
+        time.perf_counter() - t0,
+    )
     return dataset

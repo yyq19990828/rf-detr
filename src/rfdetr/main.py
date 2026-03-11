@@ -223,9 +223,15 @@ class Model:
         dataset_val = build_dataset(image_set="val", args=args, resolution=args.resolution)
         run_test = getattr(args, "run_test", True)
         if run_test:
-            dataset_test = build_dataset(
-                image_set="test" if args.dataset_file == "roboflow" else "val", args=args, resolution=args.resolution
-            )
+            test_image_set = "test" if args.dataset_file == "roboflow" else "val"
+            try:
+                dataset_test = build_dataset(image_set=test_image_set, args=args, resolution=args.resolution)
+            except FileNotFoundError:
+                if test_image_set != "val":
+                    logger.warning("Test split directory not found, falling back to val split for test evaluation.")
+                    dataset_test = build_dataset(image_set="val", args=args, resolution=args.resolution)
+                else:
+                    raise
         logger.info(f"Dataset loaded: {len(dataset_train)} training samples, {len(dataset_val)} validation samples")
 
         # for cosine annealing, calculate total training steps and warmup steps
