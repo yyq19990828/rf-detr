@@ -19,7 +19,10 @@ Train and eval functions used in main.py
 """
 
 import math
+import os
 import random
+import sys
+import time
 from typing import Iterable
 
 import torch
@@ -154,7 +157,40 @@ def train_one_epoch(
     else:
         progress_iter = enumerate(metric_logger.log_every(data_loader, print_freq, header))
 
+    start_epoch = int(getattr(args, "start_epoch", 0))
+    debug_first_batch = os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"}
+    first_batch_wait_start = None
+    if epoch == start_epoch:
+        logger.info("Loading first batch from dataloader (this may take a while on slow storage)...")
+        if debug_first_batch:
+            rank = utils.get_rank()
+            sys.stderr.write(f"[RFDETR-DEBUG][rank={rank}] waiting for first dataloader batch\n")
+            sys.stderr.flush()
+            first_batch_wait_start = time.perf_counter()
+
     for data_iter_step, (samples, targets) in progress_iter:
+        if debug_first_batch and epoch == start_epoch and data_iter_step == 0 and first_batch_wait_start is not None:
+            rank = utils.get_rank()
+            elapsed = time.perf_counter() - first_batch_wait_start
+            image_ids = []
+            for target in targets[:8]:
+                image_id = target.get("image_id")
+                if torch.is_tensor(image_id):
+                    image_ids.append(int(image_id.reshape(-1)[0].item()))
+                else:
+                    image_ids.append(image_id)
+            sys.stderr.write(
+                f"[RFDETR-DEBUG][rank={rank}] first batch loaded in {elapsed:.3f}s; "
+                f"targets={len(targets)}; image_ids={image_ids}\n"
+            )
+            sys.stderr.flush()
+            if getattr(args, "distributed", False):
+                sync_start = time.perf_counter()
+                torch.distributed.barrier()
+                sync_elapsed = time.perf_counter() - sync_start
+                sys.stderr.write(f"[RFDETR-DEBUG][rank={rank}] first-batch debug barrier {sync_elapsed:.3f}s\n")
+                sys.stderr.flush()
+
         it = start_steps + data_iter_step
         callback_dict = {
             "step": it,

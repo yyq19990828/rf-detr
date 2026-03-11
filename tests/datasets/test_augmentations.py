@@ -77,6 +77,24 @@ class TestAlbumentationsWrapper:
         assert aug_target["boxes"].shape == (0, 4)
         assert aug_target["labels"].shape == (0,)
 
+    def test_non_finite_boxes_are_filtered_before_albumentations(self):
+        wrapper = AlbumentationsWrapper(A.HorizontalFlip(p=1.0))
+
+        image = Image.new("RGB", (100, 100))
+        target = {
+            "boxes": torch.tensor([[10.0, 10.0, 30.0, 30.0], [10.0, 10.0, float("nan"), 30.0]], dtype=torch.float32),
+            "labels": torch.tensor([1, 2], dtype=torch.int64),
+            "area": torch.tensor([400.0, 0.0], dtype=torch.float32),
+            "iscrowd": torch.tensor([0, 0], dtype=torch.int64),
+        }
+
+        _, aug_target = wrapper(image, target)
+
+        assert aug_target["boxes"].shape == (1, 4)
+        assert aug_target["labels"].tolist() == [1]
+        assert aug_target["area"].shape[0] == 1
+        assert aug_target["iscrowd"].shape[0] == 1
+
     def test_multiple_boxes(self):
         """Test wrapper handles multiple bounding boxes."""
         transform = A.HorizontalFlip(p=1.0)

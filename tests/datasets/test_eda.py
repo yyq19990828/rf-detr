@@ -116,8 +116,7 @@ def test_run_eda_handles_empty_annotations(tmp_path: Path) -> None:
     assert summary["bbox_aspect_ratio_stats"] == {"min": None, "max": None, "mean": None, "median": None}
 
 
-def test_run_eda_single_class_counts_unique_images(tmp_path: Path) -> None:
-    """class_counts tracks number of images per class, not raw annotation count."""
+def test_run_eda_single_class_counts_all_annotations(tmp_path: Path) -> None:
     coco = _MockCoco(
         imgs={1: {"id": 1, "width": 64, "height": 64}},
         cats={1: {"id": 1, "name": "single"}},
@@ -133,4 +132,24 @@ def test_run_eda_single_class_counts_unique_images(tmp_path: Path) -> None:
     summary = _load_summary(output_dir / "train_eda_summary.json")
 
     assert summary["num_classes"] == 1
-    assert summary["class_counts"] == {"single": 1}
+    assert summary["class_counts"] == {"single": 2}
+
+
+def test_run_eda_ignores_malformed_bbox_values(tmp_path: Path) -> None:
+    coco = _MockCoco(
+        imgs={1: {"id": 1, "width": 64, "height": 64}},
+        cats={1: {"id": 1, "name": "single"}},
+        anns={
+            1: {"id": 1, "image_id": 1, "category_id": 1, "bbox": [0, 0, 10, 10], "area": 100},
+            2: {"id": 2, "image_id": 1, "category_id": 1, "bbox": [0, 0, "bad", 10], "area": "bad"},
+        },
+    )
+    dataset = _MockDataset(coco)
+
+    output_dir = tmp_path / "malformed"
+    run_eda(dataset=dataset, output_dir=output_dir, split="train")
+    summary = _load_summary(output_dir / "train_eda_summary.json")
+
+    assert summary["total_annotations"] == 2
+    assert summary["class_counts"] == {"single": 2}
+    assert summary["bbox_area_stats"]["min"] is not None

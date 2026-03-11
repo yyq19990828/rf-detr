@@ -11,9 +11,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import supervision as sv
+import torch
 from PIL import Image
 
-from rfdetr.datasets.yolo import CocoLikeAPI, _MockSvDataset, is_valid_yolo_dataset
+from rfdetr.datasets.yolo import CocoLikeAPI, ConvertYolo, YoloDetection, _MockSvDataset, is_valid_yolo_dataset
 
 
 class TestCocoLikeAPI:
@@ -521,3 +522,45 @@ class TestLoadYoloAnnotationsCached:
         assert len(sizes) == 1
         path = ds.image_paths[0]
         assert len(ds.annotations[path]) == 0
+
+
+class TestConvertYoloRobustness:
+    def test_convert_yolo_filters_non_finite_boxes(self) -> None:
+        converter = ConvertYolo(include_masks=False, normalized_coords=False)
+        image = Image.new("RGB", (100, 100))
+        detections = sv.Detections(
+            xyxy=np.array([[10.0, 10.0, 30.0, 30.0], [5.0, 5.0, np.nan, 20.0]], dtype=np.float32),
+            class_id=np.array([0, 1], dtype=np.int64),
+        )
+
+        _, target = converter(image, {"image_id": 0, "detections": detections})
+
+        assert target["boxes"].shape == (1, 4)
+        assert target["labels"].tolist() == [0]
+
+
+class TestYoloDetectionRobustness:
+    def test_getitem_retries_on_invalid_zero_sized_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        dataset = YoloDetection.__new__(YoloDetection)
+        dataset.ids = [10, 11]
+        dataset._transforms = None
+        dataset.prepare = lambda img, target: (img, target)
+
+        class _MockSvDataset:
+            def __len__(self) -> int:
+                return 2
+
+            def __getitem__(self, idx: int):
+                if idx == 0:
+                    bad_image = np.zeros((0, 100, 3), dtype=np.uint8)
+                    return "bad.jpg", bad_image, sv.Detections.empty()
+                good_image = np.zeros((100, 100, 3), dtype=np.uint8)
+                return "good.jpg", good_image, sv.Detections.empty()
+
+        dataset.sv_dataset = _MockSvDataset()
+        monkeypatch.setattr("random.randint", lambda _a, _b: 1)
+
+        image, target = dataset[0]
+
+        assert image.size == (100, 100)
+        assert target["image_id"] == 11

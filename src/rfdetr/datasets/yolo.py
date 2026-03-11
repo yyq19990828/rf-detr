@@ -8,6 +8,7 @@ import gc
 import hashlib
 import os
 import pickle
+import sys
 import time
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
@@ -24,6 +25,7 @@ from rfdetr.datasets.coco import (
     make_coco_transforms_square_div_64,
 )
 from rfdetr.util.logger import get_logger
+from rfdetr.util.misc import get_rank
 
 logger = get_logger()
 
@@ -501,6 +503,10 @@ class ConvertYolo:
             boxes = torch.from_numpy(detections.xyxy).to(torch.float32)
             classes = torch.from_numpy(detections.class_id).to(torch.int64)
 
+            finite_mask = torch.isfinite(boxes).all(dim=1)
+            boxes = boxes[finite_mask]
+            classes = classes[finite_mask]
+
             if self.normalized_coords:
                 boxes[:, 0::2] *= w
                 boxes[:, 1::2] *= h
@@ -882,6 +888,9 @@ class YoloDetection(VisionDataset):
 
         self.classes = self.sv_dataset.classes
         self.ids = list(range(len(self.sv_dataset)))
+        self._debug_first_batch = os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"}
+        self._debug_trace_samples = int(os.getenv("RFDETR_DEBUG_TRACE_SAMPLES", "6"))
+        self._debug_seen_samples = 0
 
         logger.info("Building COCO-compatible index for %d images …", len(self.ids))
         t0 = time.perf_counter()
@@ -907,7 +916,22 @@ class YoloDetection(VisionDataset):
         """
         import random
 
-        for _attempt in range(10):
+        debug_first_batch = getattr(
+            self,
+            "_debug_first_batch",
+            os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"},
+        )
+        debug_trace_samples = getattr(self, "_debug_trace_samples", int(os.getenv("RFDETR_DEBUG_TRACE_SAMPLES", "6")))
+        debug_seen_samples = getattr(self, "_debug_seen_samples", 0)
+        trace_this_sample = debug_first_batch and debug_seen_samples < debug_trace_samples
+        rank = get_rank() if debug_first_batch else 0
+        original_idx = idx
+        sample_start = time.perf_counter() if trace_this_sample else 0.0
+        if trace_this_sample:
+            logger.error("[RFDETR-DEBUG][rank=%d] yolo __getitem__ start idx=%d", rank, idx)
+            sys.stderr.write(f"[RFDETR-DEBUG][rank={rank}] yolo __getitem__ start idx={idx}\n")
+            sys.stderr.flush()
+        for attempt in range(10):
             try:
                 image_id = self.ids[idx]
                 image_path, cv2_image, detections = self.sv_dataset[idx]
@@ -918,6 +942,9 @@ class YoloDetection(VisionDataset):
                 # Convert BGR (OpenCV) to RGB (PIL)
                 rgb_image = cv2_image[:, :, ::-1]
                 img = Image.fromarray(rgb_image)
+                image_width, image_height = img.size
+                if image_width <= 0 or image_height <= 0:
+                    raise ValueError(f"Invalid image size for idx={idx}: width={image_width}, height={image_height}")
 
                 target = {"image_id": image_id, "detections": detections}
                 img, target = self.prepare(img, target)
@@ -925,12 +952,43 @@ class YoloDetection(VisionDataset):
                 if self._transforms is not None:
                     img, target = self._transforms(img, target)
 
+                if trace_this_sample:
+                    elapsed = time.perf_counter() - sample_start
+                    logger.error(
+                        "[RFDETR-DEBUG][rank=%d] yolo __getitem__ ok idx=%d orig_idx=%d image_id=%d elapsed=%.3fs",
+                        rank,
+                        idx,
+                        original_idx,
+                        image_id,
+                        elapsed,
+                    )
+                    sys.stderr.write(
+                        f"[RFDETR-DEBUG][rank={rank}] yolo __getitem__ ok idx={idx} "
+                        f"orig_idx={original_idx} image_id={image_id} elapsed={elapsed:.3f}s\n"
+                    )
+                    sys.stderr.flush()
+                    self._debug_seen_samples = debug_seen_samples + 1
+
                 return img, target
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     "Skipping corrupt image idx=%d, retrying with random replacement",
                     idx,
                 )
+                if debug_first_batch:
+                    logger.error(
+                        "[RFDETR-DEBUG][rank=%d] yolo retry attempt=%d/10 idx=%d err=%s: %s",
+                        rank,
+                        attempt + 1,
+                        idx,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    sys.stderr.write(
+                        f"[RFDETR-DEBUG][rank={rank}] yolo retry attempt={attempt + 1}/10 "
+                        f"idx={idx} err={type(exc).__name__}: {exc}\n"
+                    )
+                    sys.stderr.flush()
                 idx = random.randint(0, len(self.sv_dataset) - 1)
 
         raise RuntimeError("Failed to load a valid sample after 10 attempts")

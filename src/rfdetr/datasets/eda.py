@@ -7,6 +7,7 @@
 """Exploratory Data Analysis utilities for COCO-style datasets."""
 
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any, Union
@@ -75,7 +76,7 @@ def run_eda(
     total_annotations = len(coco.anns)
     num_classes = len(coco.cats)
 
-    class_image_ids: dict[int, set[int]] = {cat_id: set() for cat_id in coco.cats.keys()}
+    class_annotation_counts: dict[int, int] = {cat_id: 0 for cat_id in coco.cats.keys()}
     bbox_area_fractions: list[float] = []
     bbox_aspect_ratios: list[float] = []
 
@@ -92,25 +93,38 @@ def run_eda(
         if image_area <= 0:
             continue
 
-        if category_id in class_image_ids:
-            class_image_ids[category_id].add(image_id)
+        if category_id in class_annotation_counts:
+            class_annotation_counts[category_id] += 1
 
         bbox = ann.get("bbox", [0.0, 0.0, 0.0, 0.0])
-        bbox_width = float(bbox[2])
-        bbox_height = float(bbox[3])
+        try:
+            bbox_width = float(bbox[2])
+            bbox_height = float(bbox[3])
+        except (TypeError, ValueError, IndexError):
+            continue
 
         ann_area = ann.get("area")
-        bbox_area = float(ann_area) if ann_area is not None else bbox_width * bbox_height
-        if bbox_area >= 0:
-            bbox_area_fractions.append(bbox_area / image_area)
+        if ann_area is not None:
+            try:
+                bbox_area = float(ann_area)
+            except (TypeError, ValueError):
+                bbox_area = bbox_width * bbox_height
+        else:
+            bbox_area = bbox_width * bbox_height
+        if bbox_area >= 0 and math.isfinite(bbox_area):
+            bbox_area_fraction = bbox_area / image_area
+            if math.isfinite(bbox_area_fraction):
+                bbox_area_fractions.append(bbox_area_fraction)
 
         if bbox_width > 0 and bbox_height > 0:
-            bbox_aspect_ratios.append(bbox_width / bbox_height)
+            bbox_aspect_ratio = bbox_width / bbox_height
+            if math.isfinite(bbox_aspect_ratio):
+                bbox_aspect_ratios.append(bbox_aspect_ratio)
 
     class_counts: dict[str, int] = {}
     for cat_id, category in sorted(coco.cats.items(), key=lambda item: item[1].get("name", "")):
         class_name = category.get("name", str(cat_id))
-        class_counts[class_name] = len(class_image_ids.get(cat_id, set()))
+        class_counts[class_name] = class_annotation_counts.get(cat_id, 0)
 
     sorted_classes = sorted(class_counts.items(), key=lambda item: item[1], reverse=True)
 
@@ -123,7 +137,7 @@ def run_eda(
         plt.gca().invert_yaxis()
     else:
         plt.text(0.5, 0.5, "No classes found", ha="center", va="center")
-    plt.xlabel("Number of Images")
+    plt.xlabel("Number of Boxes")
     plt.ylabel("Class")
     plt.title(f"{split.capitalize()} Class Distribution")
     plt.tight_layout()

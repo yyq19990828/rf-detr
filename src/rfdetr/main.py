@@ -26,6 +26,7 @@ import multiprocessing
 import os
 import random
 import shutil
+import sys
 import time
 import warnings
 from copy import deepcopy
@@ -219,20 +220,65 @@ class Model:
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
         # Choose the learning rate scheduler based on the new argument
 
+        debug_first_batch = os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"}
+
+        def _debug_rank(stage: str) -> None:
+            if debug_first_batch:
+                rank = get_rank()
+                logger.error("[RFDETR-DEBUG][rank=%d] %s", rank, stage)
+                sys.stderr.write(f"[RFDETR-DEBUG][rank={rank}] {stage}\n")
+                sys.stderr.flush()
+
+        _debug_rank("before build_dataset train")
         dataset_train = build_dataset(image_set="train", args=args, resolution=args.resolution)
+        _debug_rank("after build_dataset train")
         dataset_val = build_dataset(image_set="val", args=args, resolution=args.resolution)
+        _debug_rank("after build_dataset val")
         run_test = getattr(args, "run_test", True)
+
         if run_test:
-            test_image_set = "test" if args.dataset_file == "roboflow" else "val"
-            try:
-                dataset_test = build_dataset(image_set=test_image_set, args=args, resolution=args.resolution)
-            except FileNotFoundError:
-                if test_image_set != "val":
+            test_image_set = "val"
+            if args.dataset_file == "roboflow":
+                dataset_dirs = args.dataset_dir if isinstance(args.dataset_dir, list) else [args.dataset_dir]
+                has_test_split = all(
+                    (Path(dataset_dir) / "test" / "images").exists()
+                    and (Path(dataset_dir) / "test" / "labels").exists()
+                    for dataset_dir in dataset_dirs
+                )
+                if has_test_split:
+                    test_image_set = "test"
+                elif is_main_process():
                     logger.warning("Test split directory not found, falling back to val split for test evaluation.")
-                    dataset_test = build_dataset(image_set="val", args=args, resolution=args.resolution)
-                else:
-                    raise
+
+            _debug_rank(f"before build_dataset {test_image_set}")
+            dataset_test = build_dataset(image_set=test_image_set, args=args, resolution=args.resolution)
+            _debug_rank(f"after build_dataset {test_image_set}")
         logger.info(f"Dataset loaded: {len(dataset_train)} training samples, {len(dataset_val)} validation samples")
+        _debug_rank("datasets ready")
+
+        if args.run_eda:
+            if is_main_process():
+                from rfdetr.datasets.eda import run_eda
+
+                output_dir_for_eda = args.output_dir if args.output_dir else "output"
+                dataset_dirs = args.dataset_dir if isinstance(args.dataset_dir, list) else [args.dataset_dir]
+                train_subdatasets = getattr(dataset_train, "datasets", None)
+                if train_subdatasets is not None and len(dataset_dirs) == len(train_subdatasets):
+                    for index, (dataset_dir, train_subdataset) in enumerate(
+                        zip(dataset_dirs, train_subdatasets), start=1
+                    ):
+                        run_eda(
+                            train_subdataset,
+                            output_dir_for_eda,
+                            split=f"train_dataset_{index}_{Path(dataset_dir).name}",
+                        )
+                else:
+                    run_eda(dataset_train, output_dir_for_eda, split="train")
+            if args.distributed:
+                # Keep all ranks aligned before the first training step when
+                # only rank 0 generates EDA artifacts.
+                torch.distributed.barrier()
+        _debug_rank("eda stage done")
 
         # for cosine annealing, calculate total training steps and warmup steps
         total_batch_size_for_lr = args.batch_size * get_world_size() * args.grad_accum_steps
@@ -289,6 +335,9 @@ class Model:
                 )
                 num_workers = 0
 
+        prefetch_factor = 4 if num_workers > 0 else None
+        persistent_workers = num_workers > 0
+
         if len(dataset_train) < effective_batch_size * min_batches:
             logger.info(
                 f"Training with uniform sampler because dataset is too small: {len(dataset_train)} < {effective_batch_size * min_batches}"
@@ -304,12 +353,22 @@ class Model:
                 collate_fn=utils.collate_fn,
                 num_workers=num_workers,
                 sampler=sampler,
+                pin_memory=True,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers,
             )
         else:
             batch_sampler_train = torch.utils.data.BatchSampler(sampler_train, effective_batch_size, drop_last=True)
             data_loader_train = DataLoader(
-                dataset_train, batch_sampler=batch_sampler_train, collate_fn=utils.collate_fn, num_workers=num_workers
+                dataset_train,
+                batch_sampler=batch_sampler_train,
+                collate_fn=utils.collate_fn,
+                num_workers=num_workers,
+                pin_memory=True,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers,
             )
+        _debug_rank("train dataloader ready")
 
         data_loader_val = DataLoader(
             dataset_val,
@@ -318,6 +377,9 @@ class Model:
             drop_last=False,
             collate_fn=utils.collate_fn,
             num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
         base_ds = get_coco_api_from_dataset(dataset_val)
         if args.run_test:
@@ -328,8 +390,12 @@ class Model:
                 drop_last=False,
                 collate_fn=utils.collate_fn,
                 num_workers=num_workers,
+                pin_memory=True,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers,
             )
             base_ds_test = get_coco_api_from_dataset(dataset_test)
+        _debug_rank("val/test dataloaders ready")
         if args.use_ema:
             self.ema_m = ModelEma(model_without_ddp, decay=args.ema_decay, tau=args.ema_tau)
         else:
@@ -410,6 +476,7 @@ class Model:
             DatasetGridSaver(data_loader_train, output_dir, max_batches=3, dataset_type="train").save_grid()
             DatasetGridSaver(data_loader_val, output_dir, max_batches=3, dataset_type="val").save_grid()
         logger.info("Start training")
+        _debug_rank("about to enter epoch loop")
         start_time = time.time()
         best_map_holder = BestMetricHolder(use_ema=args.use_ema)
         best_map_5095 = 0
@@ -424,6 +491,7 @@ class Model:
 
             model.train()
             criterion.train()
+            _debug_rank(f"before train_one_epoch epoch={epoch}")
             train_stats = train_one_epoch(
                 model,
                 criterion,
@@ -441,6 +509,7 @@ class Model:
                 args=args,
                 callbacks=callbacks,
             )
+            _debug_rank(f"after train_one_epoch epoch={epoch}")
             train_epoch_time = time.time() - epoch_start_time
             train_epoch_time_str = str(datetime.timedelta(seconds=int(train_epoch_time)))
             if args.output_dir:

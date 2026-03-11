@@ -88,3 +88,27 @@ def test_getitem_logs_warning_on_corrupt_skip(
 
     dataset[0]
     assert warnings == ["Skipping corrupt image idx=0, retrying with random replacement"]
+
+
+def test_getitem_retries_on_invalid_zero_sized_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset = _build_dataset(ids=[10, 11])
+    seen_indices: list[int] = []
+
+    class _MockImage:
+        def __init__(self, width: int, height: int) -> None:
+            self.size = (width, height)
+
+    def mock_super_getitem(self: CocoDetection, idx: int):
+        seen_indices.append(idx)
+        if idx == 0:
+            return _MockImage(0, 100), [{"id": idx}]
+        return _MockImage(100, 100), [{"id": idx}]
+
+    monkeypatch.setattr(torchvision.datasets.CocoDetection, "__getitem__", mock_super_getitem)
+    monkeypatch.setattr("random.randint", lambda _a, _b: 1)
+
+    image, target = dataset[0]
+
+    assert image.size == (100, 100)
+    assert target["image_id"] == 11
+    assert seen_indices == [0, 1]

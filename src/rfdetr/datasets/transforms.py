@@ -17,12 +17,12 @@
 Transforms and data augmentation for both image + bbox.
 """
 
+import warnings
 from collections.abc import Sequence
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import albumentations as A
 import numpy as np
-import PIL
 import torch
 from PIL import Image
 from torchvision.transforms import Normalize as _TVNormalize
@@ -138,8 +138,9 @@ def _is_geometric_transform(transform: A.BasicTransform) -> bool:
     if type(transform).__name__ in GEOMETRIC_TRANSFORMS:
         return True
     # Recursively check nested transforms in container transforms
-    if hasattr(transform, "transforms"):
-        return any(_is_geometric_transform(t) for t in transform.transforms)
+    nested_transforms = getattr(transform, "transforms", None)
+    if nested_transforms is not None:
+        return any(_is_geometric_transform(t) for t in nested_transforms)
     return False
 
 
@@ -390,6 +391,17 @@ class AlbumentationsWrapper:
         """
         boxes_np = self._boxes_to_numpy(target["boxes"])
         num_boxes = boxes_np.shape[0]
+        finite_mask = np.isfinite(boxes_np).all(axis=1)
+        if not np.all(finite_mask):
+            valid_indices = np.flatnonzero(finite_mask).tolist()
+            target_filtered = target.copy()
+            target_filtered["boxes"] = target["boxes"][valid_indices]
+            target_filtered["labels"] = torch.as_tensor([labels[i] for i in valid_indices], dtype=torch.long)
+            target_filtered.update(self._filter_per_instance_fields(target, num_boxes, valid_indices))
+            target = target_filtered
+            labels = [labels[i] for i in valid_indices]
+            boxes_np = self._boxes_to_numpy(target["boxes"])
+            num_boxes = boxes_np.shape[0]
         # Track indices to keep per-instance fields synchronized
         idxs = list(range(num_boxes))
         masks_list = None
@@ -404,7 +416,9 @@ class AlbumentationsWrapper:
         transform_kwargs = {"image": image_np, "bboxes": boxes_np, "category_ids": labels, "idxs": idxs}
         if masks_list is not None and len(masks_list) > 0:
             transform_kwargs["masks"] = masks_list
-        augmented = self.transform(**transform_kwargs)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always", RuntimeWarning)
+            augmented = self.transform(**transform_kwargs)
         target_out: Dict[str, Any] = target.copy()
         bboxes_aug = augmented["bboxes"]
         kept_idxs = augmented.get("idxs", idxs)
@@ -438,8 +452,8 @@ class AlbumentationsWrapper:
         return image_out, target_out
 
     def __call__(
-        self, image: PIL.Image.Image, target: Optional[Dict[str, Any]]
-    ) -> Tuple[PIL.Image.Image, Optional[Dict[str, Any]]]:
+        self, image: Image.Image, target: Optional[Dict[str, Any]]
+    ) -> Tuple[Image.Image, Optional[Dict[str, Any]]]:
         """Apply the Albumentations transform to image and target.
 
         This method handles the data format conversion between RF-DETR and Albumentations:
@@ -486,9 +500,13 @@ class AlbumentationsWrapper:
             image_np = np.array(image)
             if self._is_geometric:
                 # Geometric A.Compose requires label_fields even when there are no boxes
-                augmented = self.transform(image=image_np, bboxes=[], category_ids=[], idxs=[])
+                with warnings.catch_warnings(record=True):
+                    warnings.simplefilter("always", RuntimeWarning)
+                    augmented = self.transform(image=image_np, bboxes=[], category_ids=[], idxs=[])
             else:
-                augmented = self.transform(image=image_np)
+                with warnings.catch_warnings(record=True):
+                    warnings.simplefilter("always", RuntimeWarning)
+                    augmented = self.transform(image=image_np)
             return Image.fromarray(augmented["image"]), None
 
         # === Input Validation ===
@@ -515,7 +533,9 @@ class AlbumentationsWrapper:
             image_out, target_out = self._apply_geometric_transform(image_np, target, labels)
         else:
             # Non-geometric path: transform image only
-            augmented = self.transform(image=image_np)
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always", RuntimeWarning)
+                augmented = self.transform(image=image_np)
             image_out = Image.fromarray(augmented["image"])
             target_out = target.copy()
 

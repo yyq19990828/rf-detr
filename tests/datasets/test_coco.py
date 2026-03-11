@@ -48,12 +48,12 @@ def _make_target(annotations=_ANNOTATIONS):
 def coco_gt() -> COCO:
     coco = COCO()
     coco.dataset = {
-        "images": [{"id": 1, "width": 10, "height": 10}],
+        "images": [{"id": 1, "file_name": "image.jpg", "width": 10, "height": 10}],
         "annotations": [],
         "categories": [
-            {"id": 1, "name": "cat_1"},
-            {"id": 3, "name": "cat_3"},
-            {"id": 5, "name": "cat_5"},
+            {"id": 1, "name": "cat_1", "supercategory": "cat"},
+            {"id": 3, "name": "cat_3", "supercategory": "cat"},
+            {"id": 5, "name": "cat_5", "supercategory": "cat"},
         ],
     }
     coco.createIndex()
@@ -70,13 +70,13 @@ def coco_gt_one_indexed() -> COCO:
     """
     coco = COCO()
     coco.dataset = {
-        "images": [{"id": 1, "width": 10, "height": 10}],
+        "images": [{"id": 1, "file_name": "image.jpg", "width": 10, "height": 10}],
         "annotations": [],
         "categories": [
-            {"id": 1, "name": "cat_1"},
-            {"id": 2, "name": "cat_2"},
-            {"id": 3, "name": "cat_3"},
-            {"id": 4, "name": "cat_4"},
+            {"id": 1, "name": "cat_1", "supercategory": "cat"},
+            {"id": 2, "name": "cat_2", "supercategory": "cat"},
+            {"id": 3, "name": "cat_3", "supercategory": "cat"},
+            {"id": 4, "name": "cat_4", "supercategory": "cat"},
         ],
     }
     coco.createIndex()
@@ -142,6 +142,38 @@ class TestConvertCocoWithMapping:
         converter = ConvertCoco(cat2label=_CAT2LABEL)
         _, target = converter(_IMAGE, _make_target())
         assert target["labels"].dtype == torch.int64
+
+    def test_filters_non_finite_bbox_annotations(self):
+        converter = ConvertCoco(cat2label=_CAT2LABEL)
+        annotations = [
+            {"bbox": [10, 10, 30, 30], "category_id": 1, "area": 900, "iscrowd": 0},
+            {"bbox": [10, 10, float("nan"), 20], "category_id": 7, "area": 200, "iscrowd": 0},
+        ]
+
+        _, target = converter(_IMAGE, _make_target(annotations))
+
+        assert target["boxes"].shape[0] == 1
+        assert target["labels"].tolist() == [0]
+
+    def test_filters_non_numeric_bbox_annotations(self):
+        converter = ConvertCoco(cat2label=_CAT2LABEL)
+        annotations = [
+            {"bbox": [10, 10, 30, 30], "category_id": 1, "area": 900, "iscrowd": 0},
+            {"bbox": [10, 10, "bad", 20], "category_id": 7, "area": 200, "iscrowd": 0},
+        ]
+
+        _, target = converter(_IMAGE, _make_target(annotations))
+
+        assert target["boxes"].shape[0] == 1
+        assert target["labels"].tolist() == [0]
+
+    def test_non_numeric_area_falls_back_to_bbox_area(self):
+        converter = ConvertCoco(cat2label=_CAT2LABEL)
+        annotations = [{"bbox": [10, 10, 20, 10], "category_id": 1, "area": "bad", "iscrowd": 0}]
+
+        _, target = converter(_IMAGE, _make_target(annotations))
+
+        assert target["area"].tolist() == [200.0]
 
 
 class TestCocoEvaluatorCategoryResolutionWithMapping:

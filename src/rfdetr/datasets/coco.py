@@ -20,7 +20,10 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 """
 
 import hashlib
+import math
+import os
 import pickle
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -255,7 +258,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             self.coco = load_coco_cached(ann_file)
             self.ids = list(sorted(self.coco.imgs.keys()))
         else:
-            super(CocoDetection, self).__init__(img_folder, ann_file)
+            super(CocoDetection, self).__init__(img_folder, str(ann_file))
         self._transforms = transforms
         self.include_masks = include_masks
         if remap_category_ids:
@@ -269,6 +272,9 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             self.cat2label = None
             self.label2cat = None
         self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
+        self._debug_first_batch = os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"}
+        self._debug_trace_samples = int(os.getenv("RFDETR_DEBUG_TRACE_SAMPLES", "6"))
+        self._debug_seen_samples = 0
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         """Load a single sample, skipping corrupt images gracefully.
@@ -286,9 +292,30 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         """
         import random
 
-        for _attempt in range(10):
+        debug_first_batch = getattr(
+            self,
+            "_debug_first_batch",
+            os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"},
+        )
+        debug_trace_samples = getattr(self, "_debug_trace_samples", int(os.getenv("RFDETR_DEBUG_TRACE_SAMPLES", "6")))
+        debug_seen_samples = getattr(self, "_debug_seen_samples", 0)
+        trace_this_sample = debug_first_batch and debug_seen_samples < debug_trace_samples
+        rank = get_rank() if debug_first_batch else 0
+        original_idx = idx
+        sample_start = time.perf_counter() if trace_this_sample else 0.0
+        if trace_this_sample:
+            logger.error("[RFDETR-DEBUG][rank=%d] coco __getitem__ start idx=%d", rank, idx)
+            sys.stderr.write(f"[RFDETR-DEBUG][rank={rank}] coco __getitem__ start idx={idx}\n")
+            sys.stderr.flush()
+        for attempt in range(10):
             try:
                 img, target = super(CocoDetection, self).__getitem__(idx)
+                if hasattr(img, "size") and isinstance(img.size, tuple) and len(img.size) == 2:
+                    image_width, image_height = img.size
+                    if image_width <= 0 or image_height <= 0:
+                        raise ValueError(
+                            f"Invalid image size for idx={idx}: width={image_width}, height={image_height}"
+                        )
                 image_id = self.ids[idx]
                 target = {"image_id": image_id, "annotations": target}
                 img, target = self.prepare(img, target)
@@ -296,12 +323,43 @@ class CocoDetection(torchvision.datasets.CocoDetection):
                     img, target = self._transforms(
                         img, target
                     )  # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to normalized [cx, cy, w, h] occurs inside Normalize
+
+                if trace_this_sample:
+                    elapsed = time.perf_counter() - sample_start
+                    logger.error(
+                        "[RFDETR-DEBUG][rank=%d] coco __getitem__ ok idx=%d orig_idx=%d image_id=%d elapsed=%.3fs",
+                        rank,
+                        idx,
+                        original_idx,
+                        image_id,
+                        elapsed,
+                    )
+                    sys.stderr.write(
+                        f"[RFDETR-DEBUG][rank={rank}] coco __getitem__ ok idx={idx} "
+                        f"orig_idx={original_idx} image_id={image_id} elapsed={elapsed:.3f}s\n"
+                    )
+                    sys.stderr.flush()
+                    self._debug_seen_samples = debug_seen_samples + 1
                 return img, target
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     "Skipping corrupt image idx=%d, retrying with random replacement",
                     idx,
                 )
+                if debug_first_batch:
+                    logger.error(
+                        "[RFDETR-DEBUG][rank=%d] coco retry attempt=%d/10 idx=%d err=%s: %s",
+                        rank,
+                        attempt + 1,
+                        idx,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    sys.stderr.write(
+                        f"[RFDETR-DEBUG][rank={rank}] coco retry attempt={attempt + 1}/10 "
+                        f"idx={idx} err={type(exc).__name__}: {exc}\n"
+                    )
+                    sys.stderr.flush()
                 idx = random.randint(0, len(self.ids) - 1)
 
         raise RuntimeError("Failed to load a valid sample after 10 attempts")
@@ -346,9 +404,22 @@ class ConvertCoco(object):
         image_id = target["image_id"]
         image_id = torch.tensor([image_id])
 
-        anno = target["annotations"]
+        annotations = target["annotations"]
 
-        anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
+        anno = [obj for obj in annotations if "iscrowd" not in obj or obj["iscrowd"] == 0]
+        filtered_anno: list[dict[str, Any]] = []
+        for obj in anno:
+            bbox = obj.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                continue
+            try:
+                bbox_values = [float(v) for v in bbox[:4]]
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) for v in bbox_values):
+                continue
+            filtered_anno.append(obj)
+        anno = filtered_anno
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
@@ -357,31 +428,48 @@ class ConvertCoco(object):
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        classes: List[int] = []
+        cat2label = self.cat2label
+        class_ids: List[int] = []
         for obj in anno:
             category_id = obj["category_id"]
-            if getattr(self, "cat2label", None) is not None:
-                if category_id not in self.cat2label:
+            if cat2label is not None:
+                if category_id not in cat2label:
                     raise KeyError(
                         f"Unknown category_id {category_id} for image_id {target.get('image_id')} "
                         "encountered in annotations. Check that your category mapping matches the dataset."
                     )
-                classes.append(self.cat2label[category_id])
+                class_ids.append(cat2label[category_id])
             else:
-                classes.append(category_id)
-        classes = torch.tensor(classes, dtype=torch.int64)
+                class_ids.append(category_id)
+        class_labels = torch.tensor(class_ids, dtype=torch.int64)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
-        classes = classes[keep]
+        class_labels = class_labels[keep]
 
         target = {}
         target["boxes"] = boxes
-        target["labels"] = classes
+        target["labels"] = class_labels
         target["image_id"] = image_id
 
         # for conversion to coco api
-        area = torch.tensor([obj["area"] for obj in anno])
+        areas: list[float] = []
+        for obj in anno:
+            raw_area = obj.get("area")
+            if raw_area is not None:
+                try:
+                    area_value = float(raw_area)
+                except (TypeError, ValueError):
+                    bbox = obj["bbox"]
+                    area_value = float(bbox[2]) * float(bbox[3])
+                if not math.isfinite(area_value):
+                    area_value = 0.0
+            else:
+                bbox = obj["bbox"]
+                area_value = float(bbox[2]) * float(bbox[3])
+            areas.append(area_value)
+
+        area = torch.tensor(areas, dtype=torch.float32)
         iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
         target["area"] = area[keep]
         target["iscrowd"] = iscrowd[keep]

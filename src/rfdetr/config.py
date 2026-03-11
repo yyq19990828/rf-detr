@@ -335,7 +335,7 @@ class TrainConfig(BaseModel):
     eval_max_dets: int = 500
     eval_interval: int = 1
     log_per_class_metrics: bool = True
-    save_val_predictions: bool = False
+    save_val_predictions: bool = True
     aug_config: Optional[Dict[str, Any]] = None
     # Promoted from populate_args() — PTL migration (T4-2).
     # device is intentionally absent: PTL auto-detects accelerator via Trainer(accelerator="auto").
@@ -363,7 +363,7 @@ class TrainConfig(BaseModel):
     keep the default or set to 2.  On 24+ GB GPUs with slow storage,
     try 4 and monitor memory with ``nvidia-smi``.
     """
-    run_eda: bool = False
+    run_eda: bool = True
 
     @field_validator("ema_update_interval", "eval_interval", mode="after")
     @classmethod

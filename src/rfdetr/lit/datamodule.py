@@ -6,6 +6,7 @@
 
 """LightningDataModule for RF-DETR dataset construction and loaders (Phase 2)."""
 
+from pathlib import Path
 from typing import Any, List, Optional
 
 import torch
@@ -103,7 +104,25 @@ class RFDETRDataModule(LightningDataModule):
                     if get_rank() == 0:
                         from rfdetr.datasets.eda import run_eda
 
-                        run_eda(self._dataset_train, self.train_config.output_dir, split="train")
+                        def _run_eda_if_supported(dataset: torch.utils.data.Dataset, split_name: str) -> None:
+                            if getattr(dataset, "coco", None) is None:
+                                logger.warning("Skipping EDA for split '%s': dataset has no COCO API.", split_name)
+                                return
+                            run_eda(dataset, self.train_config.output_dir, split=split_name)
+
+                        dataset_dirs = args.dataset_dir if isinstance(args.dataset_dir, list) else [args.dataset_dir]
+                        train_subdatasets = getattr(self._dataset_train, "datasets", None)
+                        if train_subdatasets is not None and len(dataset_dirs) == len(train_subdatasets):
+                            for index, (dataset_dir, train_subdataset) in enumerate(
+                                zip(dataset_dirs, train_subdatasets),
+                                start=1,
+                            ):
+                                _run_eda_if_supported(
+                                    train_subdataset,
+                                    f"train_dataset_{index}_{Path(dataset_dir).name}",
+                                )
+                        else:
+                            _run_eda_if_supported(self._dataset_train, "train")
             if self._dataset_val is None:
                 self._dataset_val = build_dataset("val", args, args.resolution)
         elif stage == "validate":
