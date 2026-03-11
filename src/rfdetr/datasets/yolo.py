@@ -4,10 +4,12 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
+import gc
 import hashlib
 import os
 import pickle
 import time
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +65,10 @@ _IMAGE_EXTENSIONS = frozenset({".bmp", ".dng", ".jpg", ".jpeg", ".mpo", ".png", 
 
 # Cache format version – bump when the on-disk layout changes so that stale
 # caches are automatically regenerated.
-_CACHE_VERSION = 4
+_CACHE_VERSION = 5
+
+# Thread count for parallel image scanning (matches ultralytics convention).
+_NUM_THREADS = min(8, max(1, os.cpu_count() - 1))
 
 
 def _hash_directory(directory: str, extensions: frozenset[str]) -> str:
@@ -280,6 +285,7 @@ def load_yolo_annotations_cached(
         classes_c = cache["classes"]
         image_paths_c = cache["image_paths"]
         annotations_c = {ip: sv.Detections(**det_kwargs) for ip, det_kwargs in cache["annotations"].items()}
+        image_sizes_c: dict[str, tuple[int, int]] = cache.get("image_sizes", {})
         logger.info("Loaded %d images from cache %s", len(image_paths_c), cache_path)
         return (
             sv.DetectionDataset(
@@ -287,13 +293,21 @@ def load_yolo_annotations_cached(
                 images=image_paths_c,
                 annotations=annotations_c,
             ),
-            {},
+            image_sizes_c,
         )
+
+    # ---- Helper: unpickle with GC disabled for large caches --------------
+    def _fast_unpickle(data: bytes) -> dict:
+        gc.disable()
+        try:
+            return pickle.loads(data)  # noqa: S301
+        finally:
+            gc.enable()
 
     # ---- Try loading from cache (all ranks) ------------------------------
     if cache_path.exists():
         try:
-            cache = pickle.loads(cache_path.read_bytes())
+            cache = _fast_unpickle(cache_path.read_bytes())
             if cache.get("hash") == current_hash:
                 return _load_from_cache_data(cache)
             logger.info("Cache %s is stale, regenerating…", cache_path)
@@ -307,7 +321,7 @@ def load_yolo_annotations_cached(
             time.sleep(1)
             if cache_path.exists():
                 try:
-                    cache = pickle.loads(cache_path.read_bytes())
+                    cache = _fast_unpickle(cache_path.read_bytes())
                     if cache.get("hash") == current_hash:
                         return _load_from_cache_data(cache)
                 except Exception:
@@ -326,42 +340,68 @@ def load_yolo_annotations_cached(
 
     image_paths = _list_image_paths(images_directory_path)
     annotations: dict[str, sv.Detections] = {}
+    image_sizes: dict[str, tuple[int, int]] = {}
     total_skipped = 0
+    n_corrupt = 0
 
-    start_t = time.perf_counter()
-    for image_path in tqdm(image_paths, desc=f"Scanning {labels_dir.name}", unit="img"):
+    def _scan_single(image_path: str) -> tuple[str, sv.Detections | None, int, tuple[int, int] | None]:
+        """Verify one image and parse its label file.
+
+        Returns:
+            Tuple of ``(image_path, detections_or_None, n_skipped_lines,
+            (width, height)_or_None)``.  ``None`` values signal that the
+            image should be excluded (corrupt / unreadable).
+        """
+        # -- Read image header (no pixel decode) for dimensions + verify --
+        try:
+            with Image.open(image_path) as img:
+                w, h = img.size
+                img.verify()
+        except Exception:
+            return (image_path, None, 0, None)
+
         stem = Path(image_path).stem
         annotation_path = os.path.join(annotations_directory_path, f"{stem}.txt")
 
         if not os.path.exists(annotation_path):
-            annotations[image_path] = sv.Detections.empty()
-            continue
+            return (image_path, sv.Detections.empty(), 0, (w, h))
 
-        if force_masks:
-            try:
-                with Image.open(image_path) as img:
-                    w, h = img.size
-            except Exception:
-                continue
-            res_wh: tuple[int, int] = (w, h)
-        else:
-            res_wh = (1, 1)
+        try:
+            with open(annotation_path, "r") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            return (image_path, sv.Detections.empty(), 0, (w, h))
 
-        with open(annotation_path, "r") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-
+        res_wh: tuple[int, int] = (w, h) if force_masks else (1, 1)
         det, n_skip = _parse_yolo_annotations(lines, resolution_wh=res_wh, force_masks=force_masks)
-        annotations[image_path] = det
-        total_skipped += n_skip
+        return (image_path, det, n_skip, (w, h))
+
+    start_t = time.perf_counter()
+    with ThreadPool(_NUM_THREADS) as pool:
+        results = pool.imap(
+            _scan_single,
+            image_paths,
+        )
+        for image_path, det, n_skip, wh in tqdm(
+            results, total=len(image_paths), desc=f"Scanning {labels_dir.name}", unit="img"
+        ):
+            if det is None:
+                n_corrupt += 1
+                continue
+            annotations[image_path] = det
+            if wh is not None:
+                image_sizes[image_path] = wh
+            total_skipped += n_skip
 
     elapsed = time.perf_counter() - start_t
 
     valid_image_paths = list(annotations.keys())
 
     logger.info(
-        "Scanned %d images (%d valid) in %.1fs (%s)",
+        "Scanned %d images (%d valid, %d corrupt) in %.1fs (%s)",
         len(image_paths),
         len(valid_image_paths),
+        n_corrupt,
         elapsed,
         labels_dir.name,
     )
@@ -385,6 +425,7 @@ def load_yolo_annotations_cached(
         "classes": classes,
         "image_paths": valid_image_paths,
         "annotations": serialisable_annotations,
+        "image_sizes": image_sizes,
     }
 
     try:
@@ -395,7 +436,7 @@ def load_yolo_annotations_cached(
 
     return (
         sv.DetectionDataset(classes=classes, images=valid_image_paths, annotations=annotations),
-        {},
+        image_sizes,
     )
 
 

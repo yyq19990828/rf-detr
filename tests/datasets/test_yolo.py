@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import supervision as sv
+from PIL import Image
 
 from rfdetr.datasets.yolo import CocoLikeAPI, _MockSvDataset, is_valid_yolo_dataset
 
@@ -389,3 +390,134 @@ class TestIsValidYoloDataset:
         """Dataset without required split directories should be invalid."""
         (tmp_path / "data.yaml").touch()
         assert is_valid_yolo_dataset(str(tmp_path)) is False
+
+
+class TestLoadYoloAnnotationsCached:
+    """Tests for load_yolo_annotations_cached with v5 cache optimizations."""
+
+    @staticmethod
+    def _create_dataset(tmp_path: Path, num_images: int = 3) -> tuple[Path, Path, Path]:
+        """Create a minimal YOLO dataset on disk for cache testing.
+
+        Returns:
+            Tuple of (images_dir, labels_dir, data_yaml_path).
+        """
+        images_dir = tmp_path / "images"
+        labels_dir = tmp_path / "labels"
+        images_dir.mkdir()
+        labels_dir.mkdir()
+
+        data_yaml = tmp_path / "data.yaml"
+        data_yaml.write_text("names:\n  0: cat\n  1: dog\n")
+
+        for i in range(num_images):
+            # Create a small valid PNG image
+            img = Image.new("RGB", (80 + i, 60 + i), color=(i * 40, 100, 200))
+            img.save(images_dir / f"img_{i:03d}.png")
+
+            # Create a matching YOLO label
+            labels_dir.joinpath(f"img_{i:03d}.txt").write_text(f"0 0.5 0.5 0.4 0.3\n{1} 0.2 0.2 0.1 0.1\n")
+
+        return images_dir, labels_dir, data_yaml
+
+    def test_cache_written_and_loaded(self, tmp_path: Path) -> None:
+        """First call writes .cache; second call loads from it with image_sizes."""
+        from rfdetr.datasets.yolo import load_yolo_annotations_cached
+
+        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path)
+        cache_file = labels_dir / ".cache"
+
+        # First call – full scan, writes cache
+        ds1, sizes1 = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+        assert cache_file.exists()
+        assert len(ds1) == 3
+        assert len(sizes1) == 3
+
+        # Second call – should load from cache
+        ds2, sizes2 = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+        assert len(ds2) == 3
+        assert sizes2 == sizes1
+
+    def test_image_sizes_are_real_dimensions(self, tmp_path: Path) -> None:
+        """image_sizes should contain real (width, height) from image headers."""
+        from rfdetr.datasets.yolo import load_yolo_annotations_cached
+
+        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=2)
+
+        _, sizes = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+
+        for path, (w, h) in sizes.items():
+            assert w > 0 and h > 0, f"Expected positive dims, got ({w}, {h})"
+            # Verify against actual image
+            with Image.open(path) as img:
+                assert (w, h) == img.size
+
+    def test_corrupt_image_excluded(self, tmp_path: Path) -> None:
+        """Corrupt images should be excluded via Image.verify() during scan."""
+        from rfdetr.datasets.yolo import load_yolo_annotations_cached
+
+        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=2)
+
+        # Corrupt one image
+        corrupt_img = images_dir / "img_000.png"
+        corrupt_img.write_bytes(b"not a valid image at all")
+
+        ds, sizes = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+
+        # Only 1 valid image should remain
+        assert len(ds) == 1
+        assert len(sizes) == 1
+        assert str(corrupt_img) not in sizes
+
+    def test_cache_stale_after_new_image(self, tmp_path: Path) -> None:
+        """Adding a new image should invalidate the cache and trigger rescan."""
+        from rfdetr.datasets.yolo import load_yolo_annotations_cached
+
+        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=2)
+
+        # Build cache with 2 images
+        ds1, _ = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+        assert len(ds1) == 2
+
+        # Add a third image + label
+        img = Image.new("RGB", (100, 100))
+        img.save(images_dir / "img_new.png")
+        (labels_dir / "img_new.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+
+        # Should rescan and find 3 images
+        ds2, sizes2 = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+        assert len(ds2) == 3
+        assert len(sizes2) == 3
+
+    def test_cache_contains_image_sizes_key(self, tmp_path: Path) -> None:
+        """The serialized cache dict must contain an 'image_sizes' key."""
+        import pickle
+
+        from rfdetr.datasets.yolo import load_yolo_annotations_cached
+
+        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=1)
+        load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+
+        cache_data = pickle.loads((labels_dir / ".cache").read_bytes())
+        assert "image_sizes" in cache_data
+        assert len(cache_data["image_sizes"]) == 1
+
+    def test_missing_label_gets_empty_detections(self, tmp_path: Path) -> None:
+        """Images without a matching label file should get empty detections."""
+        from rfdetr.datasets.yolo import load_yolo_annotations_cached
+
+        images_dir = tmp_path / "images"
+        labels_dir = tmp_path / "labels"
+        images_dir.mkdir()
+        labels_dir.mkdir()
+        (tmp_path / "data.yaml").write_text("names:\n  0: thing\n")
+
+        # Create image but no label
+        img = Image.new("RGB", (50, 50))
+        img.save(images_dir / "lonely.png")
+
+        ds, sizes = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(tmp_path / "data.yaml"))
+        assert len(ds) == 1
+        assert len(sizes) == 1
+        path = ds.image_paths[0]
+        assert len(ds.annotations[path]) == 0
