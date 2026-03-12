@@ -7,6 +7,7 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export MASTER_PORT="${MASTER_PORT:-$((20000 + RANDOM % 20000))}"
 export RFDETR_DEBUG_FIRST_BATCH="${RFDETR_DEBUG_FIRST_BATCH:-0}"
+export CLEAR_YOLO_CACHE="${CLEAR_YOLO_CACHE:-0}"
 
 # Single GPU training (commented out)
 # python tools/train.py \
@@ -31,6 +32,13 @@ DATASET_ARGS=()
 for dataset_dir in "${DATASET_DIRS[@]}"; do
     DATASET_ARGS+=(--dataset-dir "$dataset_dir")
 done
+
+if [[ "${CLEAR_YOLO_CACHE}" == "1" ]]; then
+    echo "Clearing YOLO label caches before training..."
+    for dataset_dir in "${DATASET_DIRS[@]}"; do
+        find "${dataset_dir}" -path "*/labels/.cache" -delete
+    done
+fi
 
 MODEL_NAME="small"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"

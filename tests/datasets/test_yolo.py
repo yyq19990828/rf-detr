@@ -4,6 +4,7 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
+import shutil
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -489,6 +490,35 @@ class TestLoadYoloAnnotationsCached:
         ds2, sizes2 = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
         assert len(ds2) == 3
         assert len(sizes2) == 3
+
+    def test_cache_stale_after_dataset_is_copied_to_new_root(self, tmp_path: Path) -> None:
+        """A copied dataset should not reuse cached absolute image paths from the source root."""
+        from rfdetr.datasets.yolo import load_yolo_annotations_cached
+
+        source_root = tmp_path / "source"
+        target_root = tmp_path / "target"
+        source_root.mkdir()
+
+        images_dir, labels_dir, data_yaml = self._create_dataset(source_root, num_images=2)
+
+        ds1, _ = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
+        assert all(path.startswith(str(images_dir)) for path in ds1.image_paths)
+
+        shutil.copytree(source_root, target_root)
+
+        target_images_dir = target_root / "images"
+        target_labels_dir = target_root / "labels"
+        target_data_yaml = target_root / "data.yaml"
+
+        ds2, sizes2 = load_yolo_annotations_cached(
+            str(target_images_dir),
+            str(target_labels_dir),
+            str(target_data_yaml),
+        )
+
+        assert len(ds2) == 2
+        assert len(sizes2) == 2
+        assert all(path.startswith(str(target_images_dir)) for path in ds2.image_paths)
 
     def test_cache_contains_image_sizes_key(self, tmp_path: Path) -> None:
         """The serialized cache dict must contain an 'image_sizes' key."""

@@ -278,7 +278,12 @@ def load_yolo_annotations_cached(
     # ---- Compute directory hashes for freshness check --------------------
     img_hash = _hash_directory(images_directory_path, _IMAGE_EXTENSIONS)
     lbl_hash = _hash_directory(annotations_directory_path, frozenset({".txt"}))
-    current_hash = f"v{_CACHE_VERSION}:{img_hash}:{lbl_hash}"
+    # Include resolved dataset roots in the cache fingerprint so copied or
+    # remounted datasets do not reuse a cache that still points at stale
+    # absolute image paths from another machine.
+    images_root = str(Path(images_directory_path).resolve())
+    labels_root = str(Path(annotations_directory_path).resolve())
+    current_hash = f"v{_CACHE_VERSION}:{images_root}:{labels_root}:{img_hash}:{lbl_hash}"
 
     # ---- Helper: deserialise a validated cache dict -----------------------
     def _load_from_cache_data(
