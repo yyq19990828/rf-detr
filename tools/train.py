@@ -9,7 +9,7 @@
 RF-DETR 训练脚本
 
 使用命令行参数进行模型训练的优化脚本。
-支持多种模型变体和完整的训练参数配置。
+支持多种模型变体和与当前 `model.train()` 对齐的训练参数配置。
 
 使用示例:
     python tools/train.py --model medium --dataset-dir datasets/coco --epochs 100
@@ -18,11 +18,9 @@ RF-DETR 训练脚本
 """
 
 import argparse
+import json
 from pathlib import Path
-from typing import Any, Dict, List, Union
-
-from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
-from rfdetr.detr import RFDETRBase
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 
 def create_model_factory():
@@ -32,12 +30,71 @@ def create_model_factory():
     Returns:
         Dict[str, callable]: 模型名称到模型类的映射
     """
+    from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
+    from rfdetr.detr import RFDETRBase
+
     return {"nano": RFDETRNano, "small": RFDETRSmall, "medium": RFDETRMedium, "large": RFDETRLarge, "base": RFDETRBase}
 
 
-def parse_arguments() -> argparse.Namespace:
+def add_boolean_argument(
+    parser: argparse.ArgumentParser,
+    name: str,
+    default: Optional[bool],
+    enable_help: str,
+    disable_help: Optional[str] = None,
+) -> None:
+    """
+    添加支持 `--foo` / `--no-foo` 的布尔参数。
+
+    Args:
+        parser: 参数解析器。
+        name: 参数名，使用下划线形式。
+        default: 默认值，允许为 None 以保留三态配置。
+        enable_help: 启用该选项时的帮助信息。
+        disable_help: 禁用该选项时的帮助信息。
+    """
+    option = name.replace("_", "-")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{option}", dest=name, action="store_true", help=enable_help)
+    group.add_argument(
+        f"--no-{option}",
+        dest=name,
+        action="store_false",
+        help=disable_help or f"禁用{enable_help.removeprefix('启用')}",
+    )
+    parser.set_defaults(**{name: default})
+
+
+def parse_json_argument(value: str) -> Dict[str, Any]:
+    """
+    解析 JSON 字符串参数。
+
+    Args:
+        value: JSON 字符串。
+
+    Returns:
+        Dict[str, Any]: 解析后的字典。
+
+    Raises:
+        argparse.ArgumentTypeError: 当输入不是合法 JSON 对象时抛出。
+    """
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"无效的 JSON: {error}") from error
+
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError('参数必须是 JSON 对象，例如 \'{"HorizontalFlip": {"p": 0.5}}\'')
+
+    return parsed
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """
     解析命令行参数。
+
+    Args:
+        argv: 可选的命令行参数列表，默认读取 sys.argv。
 
     Returns:
         argparse.Namespace: 解析后的参数
@@ -48,9 +105,9 @@ def parse_arguments() -> argparse.Namespace:
         epilog="""
 使用示例:
   python tools/train.py --model medium --dataset-dir datasets/coco --epochs 100
-  python tools/train.py --model nano --dataset-dir datasets/custom --batch-size 8 --lr 2e-4
-  python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100
-  python tools/train.py --model small --dataset-dir datasets/custom --early-stopping --wandb
+  python tools/train.py --model nano --dataset-dir datasets/custom --dataset-file yolo --batch-size 8 --lr 2e-4
+  python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100 --resume output/checkpoint.pth
+  python tools/train.py --model small --dataset-dir datasets/custom --wandb --project my-project --run exp-01
         """,
     )
 
@@ -73,12 +130,24 @@ def parse_arguments() -> argparse.Namespace:
         help="数据集目录路径。可重复传入实现多目录联合训练，例如 --dataset-dir d1 --dataset-dir d2",
     )
 
+    parser.add_argument(
+        "--dataset-file",
+        type=str,
+        choices=["coco", "roboflow", "yolo"],
+        default="roboflow",
+        help="数据集格式 (默认: roboflow)",
+    )
+
     # 训练基础参数
     parser.add_argument("--epochs", type=int, default=100, help="训练轮数 (默认: 100)")
 
     parser.add_argument("--batch-size", type=int, default=4, help="批大小 (默认: 4)")
 
     parser.add_argument("--grad-accum-steps", type=int, default=4, help="梯度累积步数 (默认: 4)")
+
+    parser.add_argument("--resume", type=str, default=None, help="从指定检查点恢复训练")
+
+    parser.add_argument("--seed", type=int, default=None, help="随机种子，默认不显式设置")
 
     # 学习率参数
     parser.add_argument("--lr", type=float, default=1e-4, help="主学习率 (默认: 1e-4)")
@@ -87,15 +156,41 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="权重衰减 (默认: 1e-4)")
 
+    parser.add_argument("--lr-drop", type=int, default=100, help="学习率衰减轮数 (默认: 100)")
+
+    parser.add_argument("--warmup-epochs", type=float, default=0.0, help="学习率预热轮数 (默认: 0.0)")
+
+    parser.add_argument("--lr-vit-layer-decay", type=float, default=0.8, help="ViT 分层学习率衰减 (默认: 0.8)")
+
+    parser.add_argument("--lr-component-decay", type=float, default=0.7, help="组件学习率衰减 (默认: 0.7)")
+
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        choices=["step", "cosine"],
+        default="step",
+        help="学习率调度器类型 (默认: step)",
+    )
+
+    parser.add_argument("--lr-min-factor", type=float, default=0.0, help="cosine 调度器的最小学习率比例 (默认: 0.0)")
+
+    parser.add_argument("--clip-max-norm", type=float, default=0.1, help="梯度裁剪最大范数 (默认: 0.1)")
+
+    parser.add_argument("--drop-path", type=float, default=0.0, help="DropPath 概率 (默认: 0.0)")
+
     # 输出目录
     parser.add_argument("--output-dir", type=str, default="output", help="输出目录 (默认: output)")
 
     # EMA 参数
-    parser.add_argument("--use-ema", action="store_true", default=True, help="使用指数移动平均 (默认: True)")
-
-    parser.add_argument("--no-ema", dest="use_ema", action="store_false", help="禁用指数移动平均")
+    add_boolean_argument(
+        parser, "use_ema", default=False, enable_help="启用指数移动平均", disable_help="禁用指数移动平均"
+    )
 
     parser.add_argument("--ema-decay", type=float, default=0.993, help="EMA衰减率 (默认: 0.993)")
+
+    parser.add_argument("--ema-tau", type=int, default=100, help="EMA tau 参数 (默认: 100)")
+
+    parser.add_argument("--ema-update-interval", type=int, default=1, help="EMA 更新间隔 (默认: 1)")
 
     # 早停参数
     parser.add_argument("--early-stopping", action="store_true", default=False, help="启用早停机制")
@@ -104,41 +199,219 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.001, help="早停最小改进量 (默认: 0.001)")
 
-    # 日志记录
-    parser.add_argument("--tensorboard", action="store_true", default=True, help="启用TensorBoard日志 (默认: True)")
+    add_boolean_argument(
+        parser,
+        "early_stopping_use_ema",
+        default=False,
+        enable_help="早停时基于 EMA 指标判断",
+        disable_help="早停时不基于 EMA 指标判断",
+    )
 
-    parser.add_argument("--no-tensorboard", dest="tensorboard", action="store_false", help="禁用TensorBoard日志")
+    # 日志记录
+    add_boolean_argument(
+        parser,
+        "tensorboard",
+        default=True,
+        enable_help="启用 TensorBoard 日志",
+        disable_help="禁用 TensorBoard 日志",
+    )
 
     parser.add_argument("--wandb", action="store_true", default=False, help="启用Weights & Biases日志")
 
+    parser.add_argument("--mlflow", action="store_true", default=False, help="启用 MLflow 日志")
+
+    parser.add_argument("--clearml", action="store_true", default=False, help="启用 ClearML 日志")
+
     parser.add_argument("--project", type=str, default=None, help="W&B项目名称")
 
-    parser.add_argument("--run", type=str, default=None, help="W&B运行名称")
+    parser.add_argument("--run", type=str, default=None, help="实验运行名称")
 
     # 数据处理参数
     parser.add_argument("--num-workers", type=int, default=2, help="数据加载器工作进程数 (默认: 2)")
 
-    parser.add_argument("--multi-scale", action="store_true", default=True, help="启用多尺度训练 (默认: True)")
+    parser.add_argument("--prefetch-factor", type=int, default=None, help="每个 worker 预取批次数，默认沿用框架设置")
 
-    parser.add_argument("--no-multi-scale", dest="multi_scale", action="store_false", help="禁用多尺度训练")
+    add_boolean_argument(
+        parser,
+        "pin_memory",
+        default=None,
+        enable_help="显式启用 DataLoader pin_memory",
+        disable_help="显式禁用 DataLoader pin_memory",
+    )
+
+    add_boolean_argument(
+        parser,
+        "persistent_workers",
+        default=None,
+        enable_help="显式启用 DataLoader persistent_workers",
+        disable_help="显式禁用 DataLoader persistent_workers",
+    )
+
+    add_boolean_argument(
+        parser,
+        "multi_scale",
+        default=True,
+        enable_help="启用多尺度训练",
+        disable_help="禁用多尺度训练",
+    )
+
+    add_boolean_argument(
+        parser,
+        "expanded_scales",
+        default=True,
+        enable_help="启用扩展尺度采样",
+        disable_help="禁用扩展尺度采样",
+    )
+
+    add_boolean_argument(
+        parser,
+        "square_resize_div_64",
+        default=True,
+        enable_help="启用 64 对齐的方形缩放",
+        disable_help="禁用 64 对齐的方形缩放",
+    )
+
+    add_boolean_argument(
+        parser,
+        "do_random_resize_via_padding",
+        default=False,
+        enable_help="启用基于 padding 的随机缩放",
+        disable_help="禁用基于 padding 的随机缩放",
+    )
 
     # 进度条
-    parser.add_argument("--progress-bar", action="store_true", default=True, help="显示 tqdm 训练进度条 (默认: True)")
-
-    parser.add_argument("--no-progress-bar", dest="progress_bar", action="store_false", help="禁用 tqdm 训练进度条")
+    add_boolean_argument(
+        parser,
+        "progress_bar",
+        default=False,
+        enable_help="显示 tqdm 训练进度条",
+        disable_help="禁用 tqdm 训练进度条",
+    )
 
     # 其他训练参数
     parser.add_argument("--checkpoint-interval", type=int, default=10, help="检查点保存间隔 (默认: 10)")
 
-    parser.add_argument("--warmup-epochs", type=int, default=0, help="学习率预热轮数 (默认: 0)")
+    parser.add_argument("--group-detr", type=int, default=13, help="Group-DETR 分组数 (默认: 13)")
 
-    parser.add_argument("--lr-drop", type=int, default=100, help="学习率衰减轮数 (默认: 100)")
+    parser.add_argument("--num-select", type=int, default=300, help="后处理保留的查询数 (默认: 300)")
 
-    parser.add_argument("--run-test", action="store_true", default=True, help="训练完成后运行测试 (默认: True)")
+    parser.add_argument("--cls-loss-coef", type=float, default=1.0, help="分类损失权重 (默认: 1.0)")
 
-    parser.add_argument("--no-test", dest="run_test", action="store_false", help="训练完成后不运行测试")
+    add_boolean_argument(
+        parser,
+        "ia_bce_loss",
+        default=True,
+        enable_help="启用 IA BCE loss",
+        disable_help="禁用 IA BCE loss",
+    )
 
-    return parser.parse_args()
+    parser.add_argument("--eval-max-dets", type=int, default=500, help="评估时每张图最多保留的检测数 (默认: 500)")
+
+    parser.add_argument("--eval-interval", type=int, default=1, help="验证间隔 epoch 数 (默认: 1)")
+
+    add_boolean_argument(
+        parser,
+        "log_per_class_metrics",
+        default=True,
+        enable_help="记录每类别指标",
+        disable_help="不记录每类别指标",
+    )
+
+    add_boolean_argument(
+        parser,
+        "save_val_predictions",
+        default=True,
+        enable_help="保存验证集预测结果",
+        disable_help="不保存验证集预测结果",
+    )
+
+    add_boolean_argument(
+        parser,
+        "run_test",
+        default=False,
+        enable_help="训练完成后运行测试集评估",
+        disable_help="训练完成后不运行测试集评估",
+    )
+
+    add_boolean_argument(
+        parser,
+        "run_eda",
+        default=True,
+        enable_help="训练前运行数据 EDA",
+        disable_help="跳过数据 EDA",
+    )
+
+    add_boolean_argument(
+        parser,
+        "sync_bn",
+        default=False,
+        enable_help="启用 SyncBatchNorm",
+        disable_help="禁用 SyncBatchNorm",
+    )
+
+    add_boolean_argument(
+        parser,
+        "fp16_eval",
+        default=False,
+        enable_help="评估时启用 FP16",
+        disable_help="评估时禁用 FP16",
+    )
+
+    add_boolean_argument(
+        parser,
+        "dont_save_weights",
+        default=False,
+        enable_help="不保存训练权重",
+        disable_help="保存训练权重",
+    )
+
+    add_boolean_argument(
+        parser,
+        "train_log_sync_dist",
+        default=False,
+        enable_help="分布式训练时同步日志",
+        disable_help="分布式训练时不同步日志",
+    )
+
+    add_boolean_argument(
+        parser,
+        "train_log_on_step",
+        default=False,
+        enable_help="按 step 记录训练日志",
+        disable_help="不按 step 记录训练日志",
+    )
+
+    add_boolean_argument(
+        parser,
+        "compute_val_loss",
+        default=True,
+        enable_help="验证时计算 loss",
+        disable_help="验证时不计算 loss",
+    )
+
+    add_boolean_argument(
+        parser,
+        "compute_test_loss",
+        default=True,
+        enable_help="测试时计算 loss",
+        disable_help="测试时不计算 loss",
+    )
+
+    parser.add_argument(
+        "--aug-config",
+        type=parse_json_argument,
+        default=None,
+        help='数据增强配置，传入 JSON 对象字符串，例如 \'{"HorizontalFlip": {"p": 0.5}}\'',
+    )
+
+    parser.add_argument(
+        "--class-names",
+        nargs="+",
+        default=None,
+        help="可选的类别名称列表，未提供时由数据集自动推断",
+    )
+
+    return parser.parse_args(args=list(argv) if argv is not None else None)
 
 
 def get_model_from_factory(model_name: str) -> Any:
@@ -169,29 +442,67 @@ def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         Dict[str, Any]: 训练参数字典
     """
     train_kwargs = {
+        "dataset_file": args.dataset_file,
         "dataset_dir": normalize_dataset_dirs(args.dataset_dir),
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "grad_accum_steps": args.grad_accum_steps,
+        "resume": args.resume,
         "lr": args.lr,
         "lr_encoder": args.lr_encoder,
         "weight_decay": args.weight_decay,
+        "lr_drop": args.lr_drop,
+        "warmup_epochs": args.warmup_epochs,
+        "lr_vit_layer_decay": args.lr_vit_layer_decay,
+        "lr_component_decay": args.lr_component_decay,
+        "lr_scheduler": args.lr_scheduler,
+        "lr_min_factor": args.lr_min_factor,
+        "clip_max_norm": args.clip_max_norm,
+        "drop_path": args.drop_path,
         "output_dir": args.output_dir,
         "use_ema": args.use_ema,
         "ema_decay": args.ema_decay,
+        "ema_tau": args.ema_tau,
+        "ema_update_interval": args.ema_update_interval,
         "early_stopping": args.early_stopping,
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
+        "early_stopping_use_ema": args.early_stopping_use_ema,
         "tensorboard": args.tensorboard,
         "wandb": args.wandb,
+        "mlflow": args.mlflow,
+        "clearml": args.clearml,
         "project": args.project,
         "run": args.run,
         "num_workers": args.num_workers,
+        "prefetch_factor": args.prefetch_factor,
+        "pin_memory": args.pin_memory,
+        "persistent_workers": args.persistent_workers,
         "multi_scale": args.multi_scale,
+        "expanded_scales": args.expanded_scales,
+        "square_resize_div_64": args.square_resize_div_64,
+        "do_random_resize_via_padding": args.do_random_resize_via_padding,
         "checkpoint_interval": args.checkpoint_interval,
-        "warmup_epochs": args.warmup_epochs,
-        "lr_drop": args.lr_drop,
+        "group_detr": args.group_detr,
+        "num_select": args.num_select,
+        "ia_bce_loss": args.ia_bce_loss,
+        "cls_loss_coef": args.cls_loss_coef,
+        "eval_max_dets": args.eval_max_dets,
+        "eval_interval": args.eval_interval,
+        "log_per_class_metrics": args.log_per_class_metrics,
+        "save_val_predictions": args.save_val_predictions,
+        "aug_config": args.aug_config,
+        "class_names": args.class_names,
+        "seed": args.seed,
+        "sync_bn": args.sync_bn,
+        "fp16_eval": args.fp16_eval,
+        "dont_save_weights": args.dont_save_weights,
+        "train_log_sync_dist": args.train_log_sync_dist,
+        "train_log_on_step": args.train_log_on_step,
+        "compute_val_loss": args.compute_val_loss,
+        "compute_test_loss": args.compute_test_loss,
         "run_test": args.run_test,
+        "run_eda": args.run_eda,
         "progress_bar": args.progress_bar,
     }
 

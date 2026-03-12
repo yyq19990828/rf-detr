@@ -41,6 +41,7 @@ uv run --no-sync python -m torch.distributed.run \
     --nproc_per_node="${NPROC_PER_NODE}" \
     tools/train.py \
     --model "${MODEL_NAME}" \
+    --dataset-file yolo \
     "${DATASET_ARGS[@]}" \
     --epochs 1 \
     --batch-size 8 \
