@@ -14,13 +14,16 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
 
+import contextlib
 import copy
 import time
+from io import StringIO
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
 import torch.utils.data
 import torchvision
+from pycocotools.coco import COCO
 
 from rfdetr.datasets.coco import build_coco, build_roboflow_from_coco
 from rfdetr.datasets.o365 import build_o365
@@ -28,6 +31,84 @@ from rfdetr.datasets.yolo import YoloDetection, build_roboflow_from_yolo
 from rfdetr.util.logger import get_logger
 
 logger = get_logger()
+
+
+def _build_coco_api_with_offset(coco_api: Any, image_id_offset: int) -> COCO:
+    """Convert a dataset's COCO-like API to a real COCO object with offset image IDs."""
+    dataset_dict = copy.deepcopy(coco_api.dataset)
+
+    if image_id_offset:
+        for image in dataset_dict.get("images", []):
+            image["id"] += image_id_offset
+        for annotation in dataset_dict.get("annotations", []):
+            annotation["image_id"] += image_id_offset
+
+    merged_coco = COCO()
+    merged_coco.dataset = dataset_dict
+    with contextlib.redirect_stdout(StringIO()):
+        merged_coco.createIndex()
+
+    label2cat = getattr(coco_api, "label2cat", None)
+    if label2cat is not None:
+        merged_coco.label2cat = copy.deepcopy(label2cat)
+
+    return merged_coco
+
+
+def _merge_coco_apis(coco_apis: List[COCO]) -> Optional[COCO]:
+    """Merge multiple COCO objects into one for ConcatDataset evaluation."""
+    if not coco_apis:
+        return None
+
+    merged_dataset = {
+        "info": copy.deepcopy(coco_apis[0].dataset.get("info", {})),
+        "images": [],
+        "annotations": [],
+        "categories": copy.deepcopy(coco_apis[0].dataset.get("categories", [])),
+    }
+    for coco_api in coco_apis:
+        merged_dataset["images"].extend(copy.deepcopy(coco_api.dataset.get("images", [])))
+        merged_dataset["annotations"].extend(copy.deepcopy(coco_api.dataset.get("annotations", [])))
+
+    merged_coco = COCO()
+    merged_coco.dataset = merged_dataset
+    with contextlib.redirect_stdout(StringIO()):
+        merged_coco.createIndex()
+
+    label2cat = getattr(coco_apis[0], "label2cat", None)
+    if label2cat is not None:
+        merged_coco.label2cat = copy.deepcopy(label2cat)
+
+    return merged_coco
+
+
+class _ImageIdOffsetDataset(torch.utils.data.Dataset):
+    """Dataset wrapper that makes image IDs globally unique across concatenated datasets."""
+
+    def __init__(self, dataset: torch.utils.data.Dataset, image_id_offset: int) -> None:
+        self.dataset = dataset
+        self.image_id_offset = image_id_offset
+        coco_api = get_coco_api_from_dataset(dataset)
+        self.coco = _build_coco_api_with_offset(coco_api, image_id_offset) if coco_api is not None else None
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Any:
+        image, target = self.dataset[index]
+        target = copy.deepcopy(target)
+        image_id = target["image_id"]
+
+        if hasattr(image_id, "clone"):
+            target["image_id"] = image_id.clone()
+            target["image_id"] += self.image_id_offset
+        else:
+            target["image_id"] = image_id + self.image_id_offset
+
+        return image, target
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.dataset, name)
 
 
 def _normalize_dataset_dirs(dataset_dir: Union[str, List[str]]) -> List[str]:
@@ -40,6 +121,8 @@ def _normalize_dataset_dirs(dataset_dir: Union[str, List[str]]) -> List[str]:
 def get_coco_api_from_dataset(dataset: torch.utils.data.Dataset) -> Optional[Any]:
     """Return the COCO API object from a dataset, handling ConcatDataset."""
     if isinstance(dataset, torch.utils.data.ConcatDataset):
+        if hasattr(dataset, "coco"):
+            return dataset.coco
         if dataset.datasets:
             return get_coco_api_from_dataset(dataset.datasets[0])
         return None
@@ -111,17 +194,27 @@ def _build_multi_dir(
         return builder_fn(image_set, single_args, resolution)
 
     datasets = []
+    coco_apis = []
+    next_image_id_offset = 0
     for d in dirs:
         logger.info("Loading split '%s' from %s ...", image_set, d)
         start = time.perf_counter()
         single_args = copy.copy(args)
         single_args.dataset_dir = d
         ds = builder_fn(image_set, single_args, resolution)
-        datasets.append(ds)
+        wrapped_ds = _ImageIdOffsetDataset(ds, next_image_id_offset)
+        datasets.append(wrapped_ds)
+        if wrapped_ds.coco is not None:
+            coco_apis.append(wrapped_ds.coco)
+            image_ids = wrapped_ds.coco.getImgIds()
+            next_image_id_offset = (max(image_ids) + 1) if image_ids else next_image_id_offset
+        else:
+            next_image_id_offset += len(wrapped_ds)
         elapsed = time.perf_counter() - start
         logger.info("Loaded %d samples from %s/%s in %.2fs", len(ds), d, image_set, elapsed)
 
     merged = torch.utils.data.ConcatDataset(datasets)
+    merged.coco = _merge_coco_apis(coco_apis)
     logger.info("Merged %d datasets (%d total samples) for split '%s'", len(datasets), len(merged), image_set)
     return merged
 

@@ -15,6 +15,7 @@ import supervision as sv
 import torch
 from PIL import Image
 
+from rfdetr.datasets import build_dataset, get_coco_api_from_dataset
 from rfdetr.datasets.yolo import CocoLikeAPI, ConvertYolo, YoloDetection, _MockSvDataset, is_valid_yolo_dataset
 
 
@@ -552,6 +553,58 @@ class TestLoadYoloAnnotationsCached:
         assert len(sizes) == 1
         path = ds.image_paths[0]
         assert len(ds.annotations[path]) == 0
+
+
+class TestMultiDirYoloDataset:
+    @staticmethod
+    def _create_split_dataset(root: Path, stem: str) -> None:
+        """Create a minimal YOLO dataset root with train/valid splits."""
+        root.mkdir()
+        (root / "data.yaml").write_text("names:\n  0: car\n")
+
+        for split in ("train", "valid"):
+            images_dir = root / split / "images"
+            labels_dir = root / split / "labels"
+            images_dir.mkdir(parents=True)
+            labels_dir.mkdir(parents=True)
+
+            image_path = images_dir / f"{stem}_{split}.png"
+            Image.new("RGB", (64, 48), color=(120, 80, 40)).save(image_path)
+            (labels_dir / f"{stem}_{split}.txt").write_text("0 0.5 0.5 0.4 0.3\n")
+
+    def test_build_dataset_offsets_image_ids_across_multiple_roots(self, tmp_path: Path) -> None:
+        """Multi-root YOLO datasets should expose globally unique image IDs for evaluation."""
+        root_a = tmp_path / "dataset_a"
+        root_b = tmp_path / "dataset_b"
+        self._create_split_dataset(root_a, "a")
+        self._create_split_dataset(root_b, "b")
+
+        args = types.SimpleNamespace(
+            dataset_file="yolo",
+            dataset_dir=[str(root_a), str(root_b)],
+            square_resize_div_64=False,
+            aug_config=None,
+            segmentation_head=False,
+            multi_scale=False,
+            expanded_scales=False,
+            do_random_resize_via_padding=False,
+            patch_size=16,
+            num_windows=2,
+        )
+
+        dataset = build_dataset("val", args, resolution=640)
+
+        _, target0 = dataset[0]
+        _, target1 = dataset[1]
+
+        image_id0 = int(target0["image_id"].reshape(-1)[0].item())
+        image_id1 = int(target1["image_id"].reshape(-1)[0].item())
+
+        assert image_id0 != image_id1
+
+        coco_api = get_coco_api_from_dataset(dataset)
+        assert coco_api is not None
+        assert sorted(coco_api.getImgIds()) == sorted([image_id0, image_id1])
 
 
 class TestConvertYoloRobustness:
