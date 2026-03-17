@@ -623,10 +623,12 @@ class CocoLikeAPI:
         classes: list,
         dataset: sv.DetectionDataset,
         image_sizes: dict[str, tuple[int, int]],
+        normalized_coords: bool = False,
     ):
         self.classes = classes
         self.sv_dataset = dataset
         self.image_sizes = image_sizes
+        self.normalized_coords = normalized_coords
 
         # Build COCO dataset dict and all lookup indices in a single pass.
         self._build_all()
@@ -676,8 +678,13 @@ class CocoLikeAPI:
                 img_to_anns[img_id] = []
                 continue
 
+            xyxy = np.array(detections.xyxy, dtype=np.float32, copy=True)
+            if self.normalized_coords:
+                xyxy[:, 0::2] *= w
+                xyxy[:, 1::2] *= h
+
             # Batch-convert all boxes at once and materialise as Python lists
-            xywh_list = sv.xyxy_to_xywh(detections.xyxy).tolist()
+            xywh_list = sv.xyxy_to_xywh(xyxy).tolist()
             class_ids = detections.class_id.tolist()
             has_mask = detections.mask is not None
 
@@ -881,7 +888,8 @@ class YoloDetection(VisionDataset):
         super(YoloDetection, self).__init__(img_folder)
         self._transforms = transforms
         self.include_masks = include_masks
-        self.prepare = ConvertYolo(include_masks=include_masks, normalized_coords=not include_masks)
+        self.normalized_coords = not include_masks
+        self.prepare = ConvertYolo(include_masks=include_masks, normalized_coords=self.normalized_coords)
 
         logger.info("Loading YOLO annotations from %s …", img_folder)
         self.sv_dataset, self._image_sizes = load_yolo_annotations_cached(
@@ -899,7 +907,12 @@ class YoloDetection(VisionDataset):
 
         logger.info("Building COCO-compatible index for %d images …", len(self.ids))
         t0 = time.perf_counter()
-        self.coco = CocoLikeAPI(self.classes, self.sv_dataset, self._image_sizes)
+        self.coco = CocoLikeAPI(
+            self.classes,
+            self.sv_dataset,
+            self._image_sizes,
+            normalized_coords=self.normalized_coords,
+        )
         logger.info("COCO-compatible index built in %.2fs", time.perf_counter() - t0)
 
     def __len__(self) -> int:

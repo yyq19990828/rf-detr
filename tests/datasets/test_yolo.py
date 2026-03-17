@@ -283,6 +283,37 @@ class TestCocoLikeAPI:
         assert 1 in api.catToImgs[0]
         assert 0 in api.catToImgs[1]
 
+    def test_normalized_boxes_are_scaled_to_pixel_coordinates(self) -> None:
+        """Normalized YOLO boxes must be converted to pixel-space COCO boxes."""
+
+        class NormalizedMockDataset:
+            classes = ["car"]
+
+            def __init__(self):
+                self.image_paths = ["img_norm.jpg"]
+                self.annotations = {
+                    "img_norm.jpg": sv.Detections(
+                        xyxy=np.array([[0.25, 0.20, 0.75, 0.60]], dtype=np.float32),
+                        class_id=np.array([0], dtype=np.int64),
+                    )
+                }
+
+            def __len__(self) -> int:
+                return 1
+
+        api = CocoLikeAPI(
+            ["car"],
+            NormalizedMockDataset(),
+            {"img_norm.jpg": (200, 100)},
+            normalized_coords=True,
+        )
+
+        ann = api.loadAnns([0])[0]
+
+        assert ann["bbox"] == pytest.approx([50.0, 20.0, 100.0, 40.0])
+        assert ann["area"] == pytest.approx(4000.0)
+        assert api.getAnnIds(areaRng=[32**2, 96**2]) == [0]
+
 
 class TestBuildRoboflowFromYoloAugConfig:
     """Regression tests for #769: aug_config forwarded to transform builders."""

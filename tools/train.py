@@ -15,6 +15,7 @@ RF-DETR 训练脚本
     python tools/train.py --model medium --dataset-dir datasets/coco --epochs 100
     python tools/train.py --model nano --dataset-dir datasets/custom --batch-size 8 --lr 2e-4
     python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100
+    python tools/train.py --model small --dataset-dir datasets/custom --resume output/checkpoint.pth --eval
 """
 
 import argparse
@@ -107,6 +108,7 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
   python tools/train.py --model medium --dataset-dir datasets/coco --epochs 100
   python tools/train.py --model nano --dataset-dir datasets/custom --dataset-file yolo --batch-size 8 --lr 2e-4
   python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100 --resume output/checkpoint.pth
+  python tools/train.py --model small --dataset-dir datasets/custom --dataset-file yolo --resume output/checkpoint.pth --eval
   python tools/train.py --model small --dataset-dir datasets/custom --wandb --project my-project --run exp-01
         """,
     )
@@ -146,6 +148,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=4, help="梯度累积步数 (默认: 4)")
 
     parser.add_argument("--resume", type=str, default=None, help="从指定检查点恢复训练")
+
+    parser.add_argument("--eval", action="store_true", default=False, help="仅执行验证评估，不进入训练循环")
 
     parser.add_argument("--seed", type=int, default=None, help="随机种子，默认不显式设置")
 
@@ -448,6 +452,7 @@ def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "batch_size": args.batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "resume": args.resume,
+        "eval": args.eval,
         "lr": args.lr,
         "lr_encoder": args.lr_encoder,
         "weight_decay": args.weight_decay,
@@ -556,7 +561,8 @@ def main():
     args = parse_arguments()
     dataset_dir_arg = normalize_dataset_dirs(args.dataset_dir)
 
-    print(f"开始训练 RF-DETR-{args.model.capitalize()} 模型...")
+    mode_label = "评估" if args.eval else "训练"
+    print(f"开始{mode_label} RF-DETR-{args.model.capitalize()} 模型...")
     if isinstance(dataset_dir_arg, list):
         print(f"数据集目录数量: {len(dataset_dir_arg)}")
         print(f"数据集目录: {dataset_dir_arg}")

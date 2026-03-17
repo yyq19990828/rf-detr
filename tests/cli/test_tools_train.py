@@ -24,6 +24,7 @@ class TestToolsTrainCli:
         assert args.progress_bar is False
         assert args.run_test is False
         assert args.run_eda is True
+        assert args.eval is False
         assert args.tensorboard is True
         assert args.early_stopping is False
 
@@ -39,6 +40,7 @@ class TestToolsTrainCli:
                 "yolo",
                 "--resume",
                 "output/checkpoint.pth",
+                "--eval",
                 "--seed",
                 "123",
                 "--use-ema",
@@ -94,6 +96,7 @@ class TestToolsTrainCli:
         assert train_kwargs["dataset_dir"] == ["datasets/a", "datasets/b"]
         assert train_kwargs["dataset_file"] == "yolo"
         assert train_kwargs["resume"] == "output/checkpoint.pth"
+        assert train_kwargs["eval"] is True
         assert train_kwargs["seed"] == 123
         assert train_kwargs["use_ema"] is True
         assert train_kwargs["ema_tau"] == 250
