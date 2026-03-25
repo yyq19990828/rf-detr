@@ -198,15 +198,6 @@ class RFDETRDataModule(LightningDataModule):
     # Properties
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _get_coco_from_dataset(dataset: torch.utils.data.Dataset) -> Optional[Any]:
-        """Extract the COCO API object from a dataset, handling ConcatDataset."""
-        if isinstance(dataset, torch.utils.data.ConcatDataset):
-            if dataset.datasets:
-                return RFDETRDataModule._get_coco_from_dataset(dataset.datasets[0])
-            return None
-        return getattr(dataset, "coco", None)
-
     @property
     def class_names(self) -> Optional[List[str]]:
         """Class names from the training or validation dataset annotation file.
@@ -221,7 +212,7 @@ class RFDETRDataModule(LightningDataModule):
         for dataset in (self._dataset_train, self._dataset_val):
             if dataset is None:
                 continue
-            coco = self._get_coco_from_dataset(dataset)
+            coco = getattr(dataset, "coco", None)
             if coco is not None and hasattr(coco, "cats"):
                 return [coco.cats[k]["name"] for k in sorted(coco.cats.keys())]
         return None

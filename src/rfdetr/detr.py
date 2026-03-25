@@ -210,8 +210,8 @@ class RFDETR:
                 auto_batch.effective_batch_size,
             )
         module = RFDETRModelModule(self.model_config, config)
-        datamodule = RFDETRDataModule(self.model_config, config)
-        trainer = build_trainer(config, self.model_config, accelerator=_accelerator)
+        datamodule = self._build_data_module(self.model_config, config)
+        trainer = self._build_trainer(config, self.model_config, accelerator=_accelerator)
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
         # Sync the trained weights back so predict() / export() see the updated model.
@@ -224,6 +224,18 @@ class RFDETR:
             dataset_class_names = getattr(datamodule, "class_names", None)
             if dataset_class_names is not None:
                 self.model.class_names = dataset_class_names
+
+    def _build_data_module(self, model_config, train_config):
+        """Build the LightningDataModule. Override in subclasses for custom datasets."""
+        from rfdetr.training import RFDETRDataModule
+
+        return RFDETRDataModule(model_config, train_config)
+
+    def _build_trainer(self, train_config, model_config, **kwargs):
+        """Build the PTL Trainer. Override in subclasses for custom callbacks."""
+        from rfdetr.training import build_trainer
+
+        return build_trainer(train_config, model_config, **kwargs)
 
     def optimize_for_inference(self, compile=True, batch_size=1, dtype=torch.float32):
         self.remove_optimized_model()

@@ -109,14 +109,14 @@ class ValVisualizerCallback(Callback):
         if gt_boxes.numel() > 0:
             gt_xyxy = box_cxcywh_to_xyxy(gt_boxes)
             gt_xyxy = gt_xyxy * gt_boxes.new_tensor([image_w, image_h, image_w, image_h])
-            gt_xyxy_np = gt_xyxy.detach().cpu().numpy().astype(np.float32)
+            gt_xyxy_np = gt_xyxy.detach().cpu().float().numpy().astype(np.float32)
         else:
             gt_xyxy_np = np.empty((0, 4), dtype=np.float32)
 
         pred_boxes = prediction.get("boxes", torch.empty((0, 4), device=image_tensor.device))
         pred_scores = prediction.get("scores", torch.empty((0,), device=image_tensor.device))
         pred_xyxy_np = self._rescale_prediction_boxes(pred_boxes, target, image_w=image_w, image_h=image_h)
-        pred_scores_np = pred_scores.detach().cpu().numpy().astype(np.float32)
+        pred_scores_np = pred_scores.detach().cpu().float().numpy().astype(np.float32)
 
         return {
             "image": image,
@@ -154,7 +154,7 @@ class ValVisualizerCallback(Callback):
                 resized_boxes[:, [0, 2]] = resized_boxes[:, [0, 2]] * (float(image_w) / float(orig_w))
                 resized_boxes[:, [1, 3]] = resized_boxes[:, [1, 3]] * (float(image_h) / float(orig_h))
 
-        return resized_boxes.cpu().numpy().astype(np.float32)
+        return resized_boxes.cpu().float().numpy().astype(np.float32)
 
     def _denormalize_image(self, image_tensor: torch.Tensor) -> np.ndarray:
         """Convert a normalized image tensor into a uint8 numpy image.
@@ -168,7 +168,7 @@ class ValVisualizerCallback(Callback):
         inv_mean = image_tensor.new_tensor([-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225]).view(3, 1, 1)
         inv_std = image_tensor.new_tensor([1 / 0.229, 1 / 0.224, 1 / 0.225]).view(3, 1, 1)
         denormalized = image_tensor * inv_std + inv_mean
-        image_np = denormalized.detach().cpu().permute(1, 2, 0).numpy()
+        image_np = denormalized.detach().cpu().float().permute(1, 2, 0).numpy()
         return (np.clip(image_np, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     def _save_grid(self, epoch: int) -> None:

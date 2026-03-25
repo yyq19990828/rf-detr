@@ -19,12 +19,6 @@ COCO dataset which returns image_id for evaluation.
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 """
 
-import hashlib
-import math
-import os
-import pickle
-import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,7 +26,6 @@ import torch
 import torch.utils.data
 import torchvision
 from PIL import Image
-from pycocotools.coco import COCO
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
 from rfdetr.datasets.aug_config import AUG_CONFIG
@@ -41,125 +34,9 @@ from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
 
-_CACHE_VERSION = 1
-
 
 def is_valid_coco_dataset(dataset_dir: str) -> bool:
     return (Path(dataset_dir) / "train" / "_annotations.coco.json").exists()
-
-
-def _hash_file(file_path: Union[str, Path]) -> str:
-    """Compute the SHA256 digest of a file's content.
-
-    Args:
-        file_path: Path to the file that should be hashed.
-
-    Returns:
-        Hex-encoded SHA256 digest of the file bytes.
-    """
-    path = Path(file_path)
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _build_coco_from_cache(cache: Dict[str, Any]) -> COCO:
-    """Reconstruct a ``pycocotools.coco.COCO`` object from cached state.
-
-    Args:
-        cache: Cached COCO internals loaded from a pickle file.
-
-    Returns:
-        A reconstructed :class:`pycocotools.coco.COCO` object.
-    """
-    coco = COCO()
-    coco.dataset = cache["dataset"]
-    coco.anns = cache["anns"]
-    coco.cats = cache["cats"]
-    coco.imgs = cache["imgs"]
-    coco.imgToAnns = cache["imgToAnns"]
-    coco.catToImgs = cache["catToImgs"]
-    return coco
-
-
-def load_coco_cached(ann_file: Union[str, Path]) -> COCO:
-    """Load COCO annotations with DDP-safe ``.coco_cache`` support.
-
-    This mirrors the YOLO cache pattern: all processes attempt to read cache,
-    rank 0 regenerates stale/missing cache, and non-zero ranks wait for the
-    rank 0 cache artifact.
-
-    Args:
-        ann_file: Path to the COCO annotation JSON file.
-
-    Returns:
-        Parsed :class:`pycocotools.coco.COCO` object loaded from cache or JSON.
-    """
-    ann_path = Path(ann_file)
-    cache_path = ann_path.parent / ".coco_cache"
-    current_hash = _hash_file(ann_path)
-
-    def _load_if_fresh() -> Optional[COCO]:
-        if not cache_path.exists():
-            return None
-        try:
-            cache_data = pickle.loads(cache_path.read_bytes())
-            if cache_data.get("version") == _CACHE_VERSION and cache_data.get("hash") == current_hash:
-                logger.info("Loaded COCO annotations from cache %s", cache_path)
-                return _build_coco_from_cache(cache_data)
-            logger.info("COCO cache %s is stale, regenerating...", cache_path)
-        except Exception:
-            logger.warning("Failed to load COCO cache %s, regenerating...", cache_path)
-        return None
-
-    cached = _load_if_fresh()
-    if cached is not None:
-        return cached
-
-    rank = get_rank()
-    is_distributed = is_dist_avail_and_initialized()
-    if is_distributed and rank != 0:
-        logger.info("Rank %d waiting for rank 0 to build COCO cache %s ...", rank, cache_path)
-        for _wait in range(3600):
-            time.sleep(1)
-            cached = _load_if_fresh()
-            if cached is not None:
-                return cached
-        raise RuntimeError(f"Rank {rank}: timed out waiting for rank 0 to write cache {cache_path}")
-
-    coco = COCO(str(ann_path))
-    cache_data = {
-        "version": _CACHE_VERSION,
-        "hash": current_hash,
-        "dataset": coco.dataset,
-        "anns": coco.anns,
-        "cats": coco.cats,
-        "imgs": coco.imgs,
-        "imgToAnns": coco.imgToAnns,
-        "catToImgs": coco.catToImgs,
-    }
-
-    try:
-        cache_path.write_bytes(pickle.dumps(cache_data))
-        logger.info("Saved COCO cache -> %s", cache_path)
-    except OSError:
-        logger.warning("Could not write COCO cache file %s", cache_path)
-
-    return coco
-
-
-def load_coco_annotations_cached(ann_file: Union[str, Path]) -> COCO:
-    """Backward-compatible helper that delegates to ``load_coco_cached``.
-
-    Args:
-        ann_file: Path to the COCO annotation JSON file.
-
-    Returns:
-        Parsed :class:`pycocotools.coco.COCO` object.
-    """
-    return load_coco_cached(ann_file)
 
 
 def compute_multi_scale_scales(
@@ -251,14 +128,8 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         transforms: Optional[Any],
         include_masks: bool = False,
         remap_category_ids: bool = False,
-        use_cache: bool = False,
     ) -> None:
-        if use_cache:
-            torchvision.datasets.VisionDataset.__init__(self, img_folder)
-            self.coco = load_coco_cached(ann_file)
-            self.ids = list(sorted(self.coco.imgs.keys()))
-        else:
-            super(CocoDetection, self).__init__(img_folder, str(ann_file))
+        super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.include_masks = include_masks
         if remap_category_ids:
@@ -272,9 +143,6 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             self.cat2label = None
             self.label2cat = None
         self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
-        self._debug_first_batch = os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"}
-        self._debug_trace_samples = int(os.getenv("RFDETR_DEBUG_TRACE_SAMPLES", "6"))
-        self._debug_seen_samples = 0
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         img, target = super(CocoDetection, self).__getitem__(idx)
@@ -327,22 +195,9 @@ class ConvertCoco(object):
         image_id = target["image_id"]
         image_id = torch.tensor([image_id])
 
-        annotations = target["annotations"]
+        anno = target["annotations"]
 
-        anno = [obj for obj in annotations if "iscrowd" not in obj or obj["iscrowd"] == 0]
-        filtered_anno: list[dict[str, Any]] = []
-        for obj in anno:
-            bbox = obj.get("bbox")
-            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-                continue
-            try:
-                bbox_values = [float(v) for v in bbox[:4]]
-            except (TypeError, ValueError):
-                continue
-            if not all(math.isfinite(v) for v in bbox_values):
-                continue
-            filtered_anno.append(obj)
-        anno = filtered_anno
+        anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
@@ -351,48 +206,31 @@ class ConvertCoco(object):
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        cat2label = self.cat2label
-        class_ids: List[int] = []
+        classes: List[int] = []
         for obj in anno:
             category_id = obj["category_id"]
-            if cat2label is not None:
-                if category_id not in cat2label:
+            if getattr(self, "cat2label", None) is not None:
+                if category_id not in self.cat2label:
                     raise KeyError(
                         f"Unknown category_id {category_id} for image_id {target.get('image_id')} "
                         "encountered in annotations. Check that your category mapping matches the dataset."
                     )
-                class_ids.append(cat2label[category_id])
+                classes.append(self.cat2label[category_id])
             else:
-                class_ids.append(category_id)
-        class_labels = torch.tensor(class_ids, dtype=torch.int64)
+                classes.append(category_id)
+        classes = torch.tensor(classes, dtype=torch.int64)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
-        class_labels = class_labels[keep]
+        classes = classes[keep]
 
         target = {}
         target["boxes"] = boxes
-        target["labels"] = class_labels
+        target["labels"] = classes
         target["image_id"] = image_id
 
         # for conversion to coco api
-        areas: list[float] = []
-        for obj in anno:
-            raw_area = obj.get("area")
-            if raw_area is not None:
-                try:
-                    area_value = float(raw_area)
-                except (TypeError, ValueError):
-                    bbox = obj["bbox"]
-                    area_value = float(bbox[2]) * float(bbox[3])
-                if not math.isfinite(area_value):
-                    area_value = 0.0
-            else:
-                bbox = obj["bbox"]
-                area_value = float(bbox[2]) * float(bbox[3])
-            areas.append(area_value)
-
-        area = torch.tensor(areas, dtype=torch.float32)
+        area = torch.tensor([obj["area"] for obj in anno])
         iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
         target["area"] = area[keep]
         target["iscrowd"] = iscrowd[keep]
@@ -746,7 +584,6 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             ),
             include_masks=include_masks,
             remap_category_ids=True,
-            use_cache=True,
         )
     else:
         logger.info(f"Building Roboflow {image_set} dataset at resolution {resolution}")
@@ -765,6 +602,5 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             ),
             include_masks=include_masks,
             remap_category_ids=True,
-            use_cache=True,
         )
     return dataset

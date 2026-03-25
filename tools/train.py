@@ -20,21 +20,27 @@ RF-DETR 训练脚本
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
+
+# 确保项目根目录在 sys.path 上，以便 import plugin/
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 
 def create_model_factory():
     """
     创建模型工厂函数，根据模型名称返回相应的模型实例。
+    使用 plugin/ 中的增强版本，包含缓存、容错、EDA 等自定义功能。
 
     Returns:
         Dict[str, callable]: 模型名称到模型类的映射
     """
-    from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
-    from rfdetr.detr import RFDETRBase
+    from plugin.model import create_plugin_model_factory
 
-    return {"nano": RFDETRNano, "small": RFDETRSmall, "medium": RFDETRMedium, "large": RFDETRLarge, "base": RFDETRBase}
+    return create_plugin_model_factory()
 
 
 def add_boolean_argument(
@@ -581,6 +587,12 @@ def main():
 
     # 准备训练参数
     train_kwargs = prepare_train_kwargs(args)
+
+    # eval-only 模式：跳过训练，直接运行验证/测试评估
+    eval_only = train_kwargs.pop("eval", False)
+    if eval_only:
+        train_kwargs["epochs"] = 0
+        train_kwargs["run_test"] = True
 
     # 开始训练
     model.train(**train_kwargs)

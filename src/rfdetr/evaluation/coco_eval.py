@@ -309,7 +309,7 @@ def patched_pycocotools_summarize(self: COCOeval) -> None:
 
     def _summarize(ap: int = 1, iouThr: Optional[float] = None, areaRng: str = "all", maxDets: int = 100) -> float:
         p = self.params
-        iStr = " {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:>5s}"
+        iStr = " {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:0.3f}"
         titleStr = "Average Precision" if ap == 1 else "Average Recall"
         typeStr = "(AP)" if ap == 1 else "(AR)"
         iouStr = "{:0.2f}:{:0.2f}".format(p.iouThrs[0], p.iouThrs[-1]) if iouThr is None else "{:0.2f}".format(iouThr)

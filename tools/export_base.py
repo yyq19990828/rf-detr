@@ -15,7 +15,7 @@ import onnxsim
 import torch
 
 from rfdetr import RFDETRBase
-from rfdetr.deploy._onnx import OnnxOptimizer
+from rfdetr.export._onnx import OnnxOptimizer
 
 
 def export_model(args):
@@ -72,7 +72,7 @@ def onnx_simplify(onnx_dir: str, input_names, input_tensors, force=False):
     print(f"Start simplifying ONNX model: {onnx_dir}")
     opt = OnnxOptimizer(onnx_dir)
     opt.info("Model: original")
-    opt.insert_convx_layernorm_plugin()
+    opt.insert_layernorm_plugin()
     opt.common_opt()
     opt.info("Model: optimized")
     opt.save_onnx(sim_onnx_dir)
