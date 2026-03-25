@@ -4,19 +4,22 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-import gc
-import hashlib
+from __future__ import annotations
+
+
 import os
 import pickle
 import sys
 import time
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import supervision as sv
 import torch
+
+if TYPE_CHECKING:
+    import supervision as sv
 from PIL import Image
 from torchvision.datasets import VisionDataset
 
@@ -677,6 +680,9 @@ class CocoLikeAPI:
             if n_det == 0:
                 img_to_anns[img_id] = []
                 continue
+            for i in range(len(detections)):
+                x1, y1, x2, y2 = detections.xyxy[i]
+                bbox_x, bbox_y, bbox_w, bbox_h = float(x1), float(y1), float(x2 - x1), float(y2 - y1)
 
             xyxy = np.array(detections.xyxy, dtype=np.float32, copy=True)
             if self.normalized_coords:
@@ -891,8 +897,10 @@ class YoloDetection(VisionDataset):
         self.normalized_coords = not include_masks
         self.prepare = ConvertYolo(include_masks=include_masks, normalized_coords=self.normalized_coords)
 
-        logger.info("Loading YOLO annotations from %s …", img_folder)
-        self.sv_dataset, self._image_sizes = load_yolo_annotations_cached(
+        import supervision as sv
+
+        # Load dataset using supervision's from_yolo method
+        self.sv_dataset = sv.DetectionDataset.from_yolo(
             images_directory_path=img_folder,
             annotations_directory_path=lb_folder,
             data_yaml_path=data_file,

@@ -28,7 +28,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import pycocotools.mask as coco_mask
 import torch
 import torch.utils.data
 import torchvision
@@ -38,8 +37,7 @@ from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
 from rfdetr.datasets.aug_config import AUG_CONFIG
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
-from rfdetr.util.logger import get_logger
-from rfdetr.util.misc import get_rank, is_dist_avail_and_initialized
+from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
 
@@ -185,6 +183,8 @@ def convert_coco_poly_to_mask(segmentations: List[Any], height: int, width: int)
     """Convert polygon segmentation to a binary mask tensor of shape [N, H, W].
     Requires pycocotools.
     """
+    import pycocotools.mask as coco_mask
+
     masks = []
     for polygons in segmentations:
         if polygons is None or len(polygons) == 0:
@@ -277,92 +277,15 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         self._debug_seen_samples = 0
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
-        """Load a single sample, skipping corrupt images gracefully.
-
-        If an image cannot be read (e.g. truncated file on disk), the method
-        retries with a random replacement index.  This mirrors the behaviour
-        of Ultralytics YOLO, ensuring that a handful of broken files on a
-        mechanical drive never crash a long training run.
-
-        Args:
-            idx: Sample index.
-
-        Returns:
-            A ``(image, target)`` tuple suitable for the training pipeline.
-        """
-        import random
-
-        debug_first_batch = getattr(
-            self,
-            "_debug_first_batch",
-            os.getenv("RFDETR_DEBUG_FIRST_BATCH", "0").lower() in {"1", "true", "yes", "on"},
-        )
-        debug_trace_samples = getattr(self, "_debug_trace_samples", int(os.getenv("RFDETR_DEBUG_TRACE_SAMPLES", "6")))
-        debug_seen_samples = getattr(self, "_debug_seen_samples", 0)
-        trace_this_sample = debug_first_batch and debug_seen_samples < debug_trace_samples
-        rank = get_rank() if debug_first_batch else 0
-        original_idx = idx
-        sample_start = time.perf_counter() if trace_this_sample else 0.0
-        if trace_this_sample:
-            logger.error("[RFDETR-DEBUG][rank=%d] coco __getitem__ start idx=%d", rank, idx)
-            sys.stderr.write(f"[RFDETR-DEBUG][rank={rank}] coco __getitem__ start idx={idx}\n")
-            sys.stderr.flush()
-        for attempt in range(10):
-            try:
-                img, target = super(CocoDetection, self).__getitem__(idx)
-                if hasattr(img, "size") and isinstance(img.size, tuple) and len(img.size) == 2:
-                    image_width, image_height = img.size
-                    if image_width <= 0 or image_height <= 0:
-                        raise ValueError(
-                            f"Invalid image size for idx={idx}: width={image_width}, height={image_height}"
-                        )
-                image_id = self.ids[idx]
-                target = {"image_id": image_id, "annotations": target}
-                img, target = self.prepare(img, target)
-                if self._transforms is not None:
-                    img, target = self._transforms(
-                        img, target
-                    )  # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to normalized [cx, cy, w, h] occurs inside Normalize
-
-                if trace_this_sample:
-                    elapsed = time.perf_counter() - sample_start
-                    logger.error(
-                        "[RFDETR-DEBUG][rank=%d] coco __getitem__ ok idx=%d orig_idx=%d image_id=%d elapsed=%.3fs",
-                        rank,
-                        idx,
-                        original_idx,
-                        image_id,
-                        elapsed,
-                    )
-                    sys.stderr.write(
-                        f"[RFDETR-DEBUG][rank={rank}] coco __getitem__ ok idx={idx} "
-                        f"orig_idx={original_idx} image_id={image_id} elapsed={elapsed:.3f}s\n"
-                    )
-                    sys.stderr.flush()
-                    self._debug_seen_samples = debug_seen_samples + 1
-                return img, target
-            except Exception as exc:
-                logger.warning(
-                    "Skipping corrupt image idx=%d, retrying with random replacement",
-                    idx,
-                )
-                if debug_first_batch:
-                    logger.error(
-                        "[RFDETR-DEBUG][rank=%d] coco retry attempt=%d/10 idx=%d err=%s: %s",
-                        rank,
-                        attempt + 1,
-                        idx,
-                        type(exc).__name__,
-                        exc,
-                    )
-                    sys.stderr.write(
-                        f"[RFDETR-DEBUG][rank={rank}] coco retry attempt={attempt + 1}/10 "
-                        f"idx={idx} err={type(exc).__name__}: {exc}\n"
-                    )
-                    sys.stderr.flush()
-                idx = random.randint(0, len(self.ids) - 1)
-
-        raise RuntimeError("Failed to load a valid sample after 10 attempts")
+        img, target = super(CocoDetection, self).__getitem__(idx)
+        image_id = self.ids[idx]
+        target = {"image_id": image_id, "annotations": target}
+        img, target = self.prepare(img, target)
+        if self._transforms is not None:
+            # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to
+            # normalized [cx, cy, w, h] occurs inside Normalize
+            img, target = self._transforms(img, target)
+        return img, target
 
 
 class ConvertCoco(object):
@@ -589,12 +512,12 @@ def make_coco_transforms(
     For the ``"train"`` split the pipeline uses a two-branch ``OneOf`` between a
     direct resize and a resize → random-crop → resize sequence (built via
     :func:`_build_train_resize_config`), followed by the augmentation stack and
-    normalisation.  For ``"val"`` and ``"val_speed"`` only resize and
-    normalisation are applied.
+    normalisation.  For ``"val"``, ``"test"``, and ``"val_speed"`` only resize and
+    normalisation are applied — no augmentation.
 
     Args:
-        image_set: Dataset split identifier — ``"train"``, ``"val"``, or
-            ``"val_speed"``.
+        image_set: Dataset split identifier — ``"train"``, ``"val"``, ``"test"``,
+            or ``"val_speed"``.
         resolution: Target short-side resolution in pixels.  During validation the
             longest side is capped at 1333 px to preserve aspect ratio.
         multi_scale: If ``True``, sample the resize target from a range of scales
@@ -640,7 +563,7 @@ def make_coco_transforms(
         aug_wrappers = AlbumentationsWrapper.from_config(resolved_aug_config)
         return Compose([*resize_wrappers, *aug_wrappers, to_image, to_float, normalize])
 
-    if image_set == "val":
+    if image_set in ("val", "test"):
         resize_wrappers = AlbumentationsWrapper.from_config(
             [
                 {"SmallestMaxSize": {"max_size": resolution}},
