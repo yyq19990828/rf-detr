@@ -1,12 +1,17 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 """自定义 DataModule：替换上游数据集为增强版本，添加 EDA、test fallback 等。"""
 
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import torch
 
 from rfdetr._namespace import _namespace_from_configs
-from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.datasets import build_dataset
 from rfdetr.training.module_data import RFDETRDataModule
 from rfdetr.utilities.logger import get_logger

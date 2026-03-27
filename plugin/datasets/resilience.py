@@ -1,3 +1,9 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 """装饰器：为 __getitem__ 添加 corrupt image 重试和 debug tracing。
 
 这两个装饰器可以叠加到任何数据集类的 __getitem__ 上，不修改上游代码。

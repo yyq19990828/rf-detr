@@ -1,3 +1,9 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 """YOLO 标注缓存加速模块。
 
 类似 Ultralytics 的 .cache 机制，首次加载时扫描所有图片和标注，
@@ -8,11 +14,9 @@ import gc
 import hashlib
 import os
 import pickle
-import sys
 import time
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 import supervision as sv
@@ -266,7 +270,7 @@ def load_yolo_annotations_cached(
     def _fast_unpickle(data: bytes) -> dict:
         gc.disable()
         try:
-            return pickle.loads(data)  # noqa: S301
+            return pickle.loads(data)
         finally:
             gc.enable()
 
@@ -404,4 +408,3 @@ def load_yolo_annotations_cached(
         sv.DetectionDataset(classes=classes, images=valid_image_paths, annotations=annotations),
         image_sizes,
     )
-

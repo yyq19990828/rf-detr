@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import functools
-import glob
 import importlib
 import json
 import os

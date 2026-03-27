@@ -1,8 +1,13 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 """增强版 CocoDetection：添加 corrupt resilience + debug tracing。"""
 
-from rfdetr.datasets.coco import CocoDetection
-
 from plugin.datasets.resilience import with_corrupt_resilience, with_debug_tracing
+from rfdetr.datasets.coco import CocoDetection
 
 
 class RobustCocoDetection(CocoDetection):

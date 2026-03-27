@@ -12,7 +12,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import torch
-
 from rfdetr.lit.callbacks.val_visualizer import ValVisualizerCallback
 
 

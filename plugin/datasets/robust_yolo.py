@@ -1,15 +1,18 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
 """增强版 YoloDetection：添加 corrupt resilience + debug tracing + annotation caching。"""
 
 import os
 import time
 
-from PIL import Image
-
-from rfdetr.datasets.yolo import CocoLikeAPI, ConvertYolo, YoloDetection
-from rfdetr.utilities.logger import get_logger
-
 from plugin.datasets.resilience import with_corrupt_resilience, with_debug_tracing
 from plugin.datasets.yolo_cache import load_yolo_annotations_cached
+from rfdetr.datasets.yolo import CocoLikeAPI, ConvertYolo, YoloDetection
+from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
 

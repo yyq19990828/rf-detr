@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import supervision as sv
-import torch
 from PIL import Image
 
 from rfdetr.datasets import build_dataset, get_coco_api_from_dataset

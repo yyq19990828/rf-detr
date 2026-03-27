@@ -16,6 +16,7 @@ RF-DETR 训练脚本
     python tools/train.py --model nano --dataset-dir datasets/custom --batch-size 8 --lr 2e-4
     python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100
     python tools/train.py --model small --dataset-dir datasets/custom --resume output/checkpoint.pth --eval
+    python tools/train.py --model small --dataset-dir datasets/custom --pretrain-weights output/checkpoint_best_total.pth
 """
 
 import argparse
@@ -23,6 +24,8 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
+
+import yaml
 
 # 确保项目根目录在 sys.path 上，以便 import plugin/
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -115,6 +118,7 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
   python tools/train.py --model nano --dataset-dir datasets/custom --dataset-file yolo --batch-size 8 --lr 2e-4
   python tools/train.py --model medium --dataset-dir datasets/a --dataset-dir datasets/b --epochs 100 --resume output/checkpoint.pth
   python tools/train.py --model small --dataset-dir datasets/custom --dataset-file yolo --resume output/checkpoint.pth --eval
+  python tools/train.py --model small --dataset-dir datasets/custom --pretrain-weights output/checkpoint_best_total.pth
   python tools/train.py --model small --dataset-dir datasets/custom --wandb --project my-project --run exp-01
         """,
     )
@@ -154,6 +158,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=4, help="梯度累积步数 (默认: 4)")
 
     parser.add_argument("--resume", type=str, default=None, help="从指定检查点恢复训练")
+
+    parser.add_argument("--pretrain-weights", type=str, default=None, help="以指定检查点作为初始化权重开始新训练")
 
     parser.add_argument("--eval", action="store_true", default=False, help="仅执行验证评估，不进入训练循环")
 
@@ -305,6 +311,13 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     parser.add_argument("--num-select", type=int, default=300, help="后处理保留的查询数 (默认: 300)")
 
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=None,
+        help="目标类别数。未提供时，对 YOLO 数据集会从 data.yaml 自动推断",
+    )
+
     parser.add_argument("--cls-loss-coef", type=float, default=1.0, help="分类损失权重 (默认: 1.0)")
 
     add_boolean_argument(
@@ -424,12 +437,13 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(args=list(argv) if argv is not None else None)
 
 
-def get_model_from_factory(model_name: str) -> Any:
+def get_model_from_factory(model_name: str, pretrain_weights: Optional[str] = None) -> Any:
     """
     从工厂函数获取模型实例。
 
     Args:
         model_name: 模型名称
+        pretrain_weights: 可选的初始化权重路径。
 
     Returns:
         模型实例
@@ -438,7 +452,7 @@ def get_model_from_factory(model_name: str) -> Any:
     if model_name not in factory:
         raise ValueError(f"不支持的模型: {model_name}, 支持的模型: {list(factory.keys())}")
 
-    return factory[model_name](layer_norm=True)
+    return factory[model_name](layer_norm=True, pretrain_weights=pretrain_weights)
 
 
 def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
@@ -495,6 +509,7 @@ def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "do_random_resize_via_padding": args.do_random_resize_via_padding,
         "checkpoint_interval": args.checkpoint_interval,
         "group_detr": args.group_detr,
+        "num_classes": args.num_classes,
         "num_select": args.num_select,
         "ia_bce_loss": args.ia_bce_loss,
         "cls_loss_coef": args.cls_loss_coef,
@@ -562,6 +577,49 @@ def ensure_dataset_data_yamls(dataset_dirs: Union[str, List[str]]) -> None:
         ensure_data_yaml_in_dataset_dir(dataset_dir)
 
 
+def load_yolo_class_names(dataset_dir: str) -> List[str]:
+    """Load class names from a YOLO ``data.yaml``/``data.yml`` file."""
+    dataset_path = Path(dataset_dir)
+    yaml_path = dataset_path / "data.yaml"
+    if not yaml_path.exists():
+        yaml_path = dataset_path / "data.yml"
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"未找到 YOLO 数据集配置文件: {dataset_dir}/data.yaml")
+
+    with yaml_path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+
+    names = data.get("names")
+    if isinstance(names, dict):
+        return [names[index] for index in sorted(names)]
+    if isinstance(names, list):
+        return names
+    raise ValueError(f"{yaml_path} 缺少有效的 names 字段")
+
+
+def maybe_infer_num_classes(args: argparse.Namespace, dataset_dirs: Union[str, List[str]]) -> None:
+    """Infer YOLO ``num_classes`` from dataset metadata when the user did not set it."""
+    if args.dataset_file != "yolo" or args.num_classes is not None:
+        return
+
+    dirs = [dataset_dirs] if isinstance(dataset_dirs, str) else dataset_dirs
+    class_name_sets = [load_yolo_class_names(dataset_dir) for dataset_dir in dirs]
+    expected_class_names = class_name_sets[0]
+
+    for dataset_dir, class_names in zip(dirs[1:], class_name_sets[1:]):
+        if class_names != expected_class_names:
+            raise ValueError(
+                f"多 YOLO 数据集类别定义不一致: {dataset_dir} 的 names={class_names}, "
+                f"期望与 {dirs[0]} 的 names={expected_class_names} 一致。"
+            )
+
+    # TODO(jinbo): Move dataset-driven num_classes inference into the shared training
+    # entrypoint so the CLI and Python API behave the same way.
+    args.num_classes = len(expected_class_names)
+    if args.class_names is None:
+        args.class_names = expected_class_names
+
+
 def main():
     """主函数"""
     args = parse_arguments()
@@ -581,6 +639,7 @@ def main():
     print("-" * 50)
 
     ensure_dataset_data_yamls(dataset_dir_arg)
+    maybe_infer_num_classes(args, dataset_dir_arg)
 
     # 创建模型
     model = get_model_from_factory(args.model)

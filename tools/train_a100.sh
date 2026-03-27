@@ -33,7 +33,11 @@ export CLEAR_YOLO_CACHE="${CLEAR_YOLO_CACHE:-0}"
 # Multi GPU distributed training (default)
 DATASET_DIRS=(
   "datasets/车型检测/ruqi_wuxi0728_yolo"
-  "datasets/上电/shangdian_yolo"
+  # "datasets/车型检测/s17_2023_yolo"
+  "datasets/车型检测/TYJT_2022_yolo"
+  "datasets/车型检测/TYJT_p053_yolo"
+  "datasets/车型检测/TYJT_p054_yolo"
+  "datasets/车型检测/xiandao_2023_yolo"
 )
 
 DATASET_ARGS=()

@@ -113,6 +113,8 @@ class ModelConfig(BaseConfig):
         """
         if v is None:
             return v
+        if not v.strip():
+            return None
         return os.path.realpath(os.path.expanduser(v))
 
 

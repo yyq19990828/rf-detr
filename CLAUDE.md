@@ -65,16 +65,16 @@ tools/train.py
 
 ### Plugin 功能清单
 
-| 功能 | 文件 | 说明 |
-|------|------|------|
-| corrupt image resilience | `plugin/datasets/resilience.py` | `@with_corrupt_resilience` 装饰器，最多重试 10 次 |
-| debug tracing | `plugin/datasets/resilience.py` | `@with_debug_tracing` 装饰器，`RFDETR_DEBUG_FIRST_BATCH=1` 启用 |
-| YOLO annotation caching | `plugin/datasets/yolo_cache.py` | 类 Ultralytics 的 `.cache` 机制，加速大规模数据集启动 |
-| EDA | `plugin/data_module.py` | 训练前自动运行探索性数据分析 |
-| multi-dir class validation | `plugin/model.py` | `_load_classes()` 多目录类名一致性校验 |
-| val visualizer | `plugin/callbacks/val_visualizer.py` | 验证集 3x3 预测网格可视化 |
-| epoch logger | `plugin/callbacks/epoch_logger.py` | 每 epoch 打印 loss/mAP 摘要 |
-| test split fallback | `plugin/data_module.py` | test/ 不存在时自动回退到 val/ |
+| 功能                       | 文件                                 | 说明                                                            |
+| -------------------------- | ------------------------------------ | --------------------------------------------------------------- |
+| corrupt image resilience   | `plugin/datasets/resilience.py`      | `@with_corrupt_resilience` 装饰器，最多重试 10 次               |
+| debug tracing              | `plugin/datasets/resilience.py`      | `@with_debug_tracing` 装饰器，`RFDETR_DEBUG_FIRST_BATCH=1` 启用 |
+| YOLO annotation caching    | `plugin/datasets/yolo_cache.py`      | 类 Ultralytics 的 `.cache` 机制，加速大规模数据集启动           |
+| EDA                        | `plugin/data_module.py`              | 训练前自动运行探索性数据分析                                    |
+| multi-dir class validation | `plugin/model.py`                    | `_load_classes()` 多目录类名一致性校验                          |
+| val visualizer             | `plugin/callbacks/val_visualizer.py` | 验证集 3x3 预测网格可视化                                       |
+| epoch logger               | `plugin/callbacks/epoch_logger.py`   | 每 epoch 打印 loss/mAP 摘要                                     |
+| test split fallback        | `plugin/data_module.py`              | test/ 不存在时自动回退到 val/                                   |
 
 ## 自定义工具脚本（tools/）
 

@@ -52,6 +52,12 @@ class TestModelConfigValidation:
         with pytest.raises(ValueError, match=r"Unknown attribute: 'unknown'\."):
             setattr(config, "unknown", "value")
 
+    def test_empty_pretrain_weights_is_treated_as_none(self, sample_model_config) -> None:
+        """Empty pretrain_weights values must not resolve to the current working directory."""
+        config = ModelConfig(**sample_model_config, pretrain_weights="")
+
+        assert config.pretrain_weights is None
+
 
 class TestSegmentationTrainConfigNumSelect:
     """Unit tests for SegmentationTrainConfig.num_select default and per-model values."""

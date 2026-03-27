@@ -10,7 +10,7 @@ import json
 import math
 import statistics
 from pathlib import Path
-from typing import Any, Union
+from typing import Union
 
 import torch
 
