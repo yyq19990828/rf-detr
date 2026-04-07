@@ -21,9 +21,10 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
-import torch.utils.data
 import torchvision
+import torch.utils.data
 from pycocotools.coco import COCO
+from torch.utils.data import Dataset, Subset
 
 from rfdetr.datasets.coco import build_coco, build_roboflow_from_coco
 from rfdetr.datasets.o365 import build_o365
@@ -118,7 +119,7 @@ def _normalize_dataset_dirs(dataset_dir: Union[str, List[str]]) -> List[str]:
     return [str(d) for d in dataset_dir]
 
 
-def get_coco_api_from_dataset(dataset: torch.utils.data.Dataset) -> Optional[Any]:
+def get_coco_api_from_dataset(dataset: Dataset[Any]) -> Optional[Any]:
     """Return the COCO API object from a dataset, handling ConcatDataset."""
     if isinstance(dataset, torch.utils.data.ConcatDataset):
         if hasattr(dataset, "coco"):
@@ -127,7 +128,7 @@ def get_coco_api_from_dataset(dataset: torch.utils.data.Dataset) -> Optional[Any
             return get_coco_api_from_dataset(dataset.datasets[0])
         return None
     for _ in range(10):
-        if isinstance(dataset, torch.utils.data.Subset):
+        if isinstance(dataset, Subset):
             dataset = dataset.dataset
     if isinstance(dataset, torchvision.datasets.CocoDetection):
         return dataset.coco
@@ -167,7 +168,7 @@ def detect_roboflow_format(dataset_dir: Path) -> str:
     )
 
 
-def _build_single_roboflow(image_set: str, args: Any, resolution: int) -> torch.utils.data.Dataset:
+def _build_single_roboflow(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
     """Build a single Roboflow dataset from ``args.dataset_dir`` (must be a single path)."""
     root = Path(args.dataset_dir)
     assert root.exists(), f"provided Roboflow path {root} does not exist"
@@ -184,7 +185,7 @@ def _build_multi_dir(
     args: Any,
     resolution: int,
     builder_fn: Any,
-) -> torch.utils.data.Dataset:
+) -> Dataset[Any]:
     """Build from one or more directories, merging via ConcatDataset when needed."""
     dirs = _normalize_dataset_dirs(args.dataset_dir)
 
@@ -219,7 +220,7 @@ def _build_multi_dir(
     return merged
 
 
-def build_roboflow(image_set: str, args: Any, resolution: int) -> torch.utils.data.Dataset:
+def build_roboflow(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
     """Build a Roboflow dataset, auto-detecting COCO or YOLO format.
 
     Supports multiple dataset directories via ``args.dataset_dir`` as a list.
@@ -227,7 +228,7 @@ def build_roboflow(image_set: str, args: Any, resolution: int) -> torch.utils.da
     return _build_multi_dir(image_set, args, resolution, _build_single_roboflow)
 
 
-def build_dataset(image_set: str, args: Any, resolution: int) -> torch.utils.data.Dataset:
+def build_dataset(image_set: str, args: Any, resolution: int) -> Dataset[Any]:
     """Build a dataset for the given split.
 
     Supports multiple dataset directories for ``roboflow`` and ``yolo`` formats
