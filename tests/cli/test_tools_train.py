@@ -6,7 +6,7 @@
 
 """Tests for the standalone tools/train.py CLI helper."""
 
-from tools.train import parse_arguments, prepare_train_kwargs
+from tools.train import parse_arguments, prepare_model_kwargs, prepare_train_kwargs
 
 
 class TestToolsTrainCli:
@@ -27,6 +27,12 @@ class TestToolsTrainCli:
         assert args.eval is False
         assert args.tensorboard is True
         assert args.early_stopping is False
+        assert args.strategy == "auto"
+        assert args.devices == 1
+        assert args.num_nodes == 1
+        assert args.auto_batch_target_effective == 16
+        assert args.auto_batch_max_targets_per_image == 100
+        assert args.auto_batch_ema_headroom == 0.7
 
     def test_prepare_train_kwargs_forwards_latest_train_options(self):
         """prepare_train_kwargs should forward newly added TrainConfig fields."""
@@ -43,11 +49,19 @@ class TestToolsTrainCli:
                 "--eval",
                 "--seed",
                 "123",
+                "--device",
+                "cuda:1",
                 "--use-ema",
                 "--ema-tau",
                 "250",
                 "--ema-update-interval",
                 "3",
+                "--auto-batch-target-effective",
+                "32",
+                "--auto-batch-max-targets-per-image",
+                "64",
+                "--auto-batch-ema-headroom",
+                "0.5",
                 "--early-stopping",
                 "--early-stopping-use-ema",
                 "--mlflow",
@@ -63,9 +77,19 @@ class TestToolsTrainCli:
                 "7",
                 "--num-select",
                 "128",
+                "--num-classes",
+                "5",
+                "--pretrain-weights",
+                "output/checkpoint_best_total.pth",
                 "--cls-loss-coef",
                 "2.5",
                 "--no-ia-bce-loss",
+                "--strategy",
+                "ddp",
+                "--devices",
+                "2",
+                "--num-nodes",
+                "3",
                 "--eval-max-dets",
                 "300",
                 "--eval-interval",
@@ -98,9 +122,13 @@ class TestToolsTrainCli:
         assert train_kwargs["resume"] == "output/checkpoint.pth"
         assert train_kwargs["eval"] is True
         assert train_kwargs["seed"] == 123
+        assert train_kwargs["device"] == "cuda:1"
         assert train_kwargs["use_ema"] is True
         assert train_kwargs["ema_tau"] == 250
         assert train_kwargs["ema_update_interval"] == 3
+        assert train_kwargs["auto_batch_target_effective"] == 32
+        assert train_kwargs["auto_batch_max_targets_per_image"] == 64
+        assert train_kwargs["auto_batch_ema_headroom"] == 0.5
         assert train_kwargs["early_stopping"] is True
         assert train_kwargs["early_stopping_use_ema"] is True
         assert train_kwargs["mlflow"] is True
@@ -111,10 +139,14 @@ class TestToolsTrainCli:
         assert train_kwargs["expanded_scales"] is False
         assert train_kwargs["square_resize_div_64"] is False
         assert train_kwargs["do_random_resize_via_padding"] is True
-        assert train_kwargs["group_detr"] == 7
-        assert train_kwargs["num_select"] == 128
         assert train_kwargs["cls_loss_coef"] == 2.5
-        assert train_kwargs["ia_bce_loss"] is False
+        assert "group_detr" not in train_kwargs
+        assert "num_select" not in train_kwargs
+        assert "ia_bce_loss" not in train_kwargs
+        assert "num_classes" not in train_kwargs
+        assert train_kwargs["strategy"] == "ddp"
+        assert train_kwargs["devices"] == 2
+        assert train_kwargs["num_nodes"] == 3
         assert train_kwargs["eval_max_dets"] == 300
         assert train_kwargs["eval_interval"] == 2
         assert train_kwargs["log_per_class_metrics"] is False
@@ -131,3 +163,11 @@ class TestToolsTrainCli:
         assert train_kwargs["run_test"] is True
         assert train_kwargs["run_eda"] is False
         assert train_kwargs["progress_bar"] is True
+
+        model_kwargs = prepare_model_kwargs(args)
+        assert model_kwargs["device"] == "cpu"
+        assert model_kwargs["pretrain_weights"] == "output/checkpoint_best_total.pth"
+        assert model_kwargs["group_detr"] == 7
+        assert model_kwargs["num_classes"] == 5
+        assert model_kwargs["num_select"] == 128
+        assert model_kwargs["ia_bce_loss"] is False

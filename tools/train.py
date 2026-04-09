@@ -99,6 +99,27 @@ def parse_json_argument(value: str) -> Dict[str, Any]:
     return parsed
 
 
+def parse_batch_size(value: str) -> Union[int, str]:
+    """Parse ``--batch-size`` as a positive integer or the literal ``auto``."""
+    if value == "auto":
+        return value
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("batch-size must be a positive integer or 'auto'") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("batch-size must be >= 1 or 'auto'")
+    return parsed
+
+
+def parse_int_or_string(value: str) -> Union[int, str]:
+    """Parse integer-like CLI values as int, preserving other strings."""
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """
     解析命令行参数。
@@ -153,7 +174,7 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # 训练基础参数
     parser.add_argument("--epochs", type=int, default=100, help="训练轮数 (默认: 100)")
 
-    parser.add_argument("--batch-size", type=int, default=4, help="批大小 (默认: 4)")
+    parser.add_argument("--batch-size", type=parse_batch_size, default=4, help="批大小，或 auto 自动探测 (默认: 4)")
 
     parser.add_argument("--grad-accum-steps", type=int, default=4, help="梯度累积步数 (默认: 4)")
 
@@ -164,6 +185,13 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval", action="store_true", default=False, help="仅执行验证评估，不进入训练循环")
 
     parser.add_argument("--seed", type=int, default=None, help="随机种子，默认不显式设置")
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="训练设备，例如 cpu、cuda、cuda:0、mps。默认由框架自动选择",
+    )
 
     # 学习率参数
     parser.add_argument("--lr", type=float, default=1e-4, help="主学习率 (默认: 1e-4)")
@@ -207,6 +235,28 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--ema-tau", type=int, default=100, help="EMA tau 参数 (默认: 100)")
 
     parser.add_argument("--ema-update-interval", type=int, default=1, help="EMA 更新间隔 (默认: 1)")
+
+    # 自动 batch size 参数
+    parser.add_argument(
+        "--auto-batch-target-effective",
+        type=int,
+        default=16,
+        help="batch-size=auto 时每设备目标 effective batch size (默认: 16)",
+    )
+
+    parser.add_argument(
+        "--auto-batch-max-targets-per-image",
+        type=int,
+        default=100,
+        help="batch-size=auto 探测时假设的每图最大目标数 (默认: 100)",
+    )
+
+    parser.add_argument(
+        "--auto-batch-ema-headroom",
+        type=float,
+        default=0.7,
+        help="启用 EMA 时 auto batch 的安全余量倍率 (默认: 0.7)",
+    )
 
     # 早停参数
     parser.add_argument("--early-stopping", action="store_true", default=False, help="启用早停机制")
@@ -307,15 +357,15 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # 其他训练参数
     parser.add_argument("--checkpoint-interval", type=int, default=10, help="检查点保存间隔 (默认: 10)")
 
-    parser.add_argument("--group-detr", type=int, default=13, help="Group-DETR 分组数 (默认: 13)")
+    parser.add_argument("--group-detr", type=int, default=13, help="模型架构 Group-DETR 分组数 (默认: 13)")
 
-    parser.add_argument("--num-select", type=int, default=300, help="后处理保留的查询数 (默认: 300)")
+    parser.add_argument("--num-select", type=int, default=300, help="模型后处理保留的查询数 (默认: 300)")
 
     parser.add_argument(
         "--num-classes",
         type=int,
         default=None,
-        help="目标类别数。未提供时，对 YOLO 数据集会从 data.yaml 自动推断",
+        help="目标类别数。未提供时由 RFDETR.train() 从数据集自动推断；YOLO 会先从 data.yaml 校验并推断",
     )
 
     parser.add_argument("--cls-loss-coef", type=float, default=1.0, help="分类损失权重 (默认: 1.0)")
@@ -327,6 +377,17 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         enable_help="启用 IA BCE loss",
         disable_help="禁用 IA BCE loss",
     )
+
+    parser.add_argument("--strategy", type=str, default="auto", help="PyTorch Lightning strategy (默认: auto)")
+
+    parser.add_argument(
+        "--devices",
+        type=parse_int_or_string,
+        default=1,
+        help="PyTorch Lightning devices，例如 1、2、auto、0,1 (默认: 1)",
+    )
+
+    parser.add_argument("--num-nodes", type=int, default=1, help="多机训练节点数 (默认: 1)")
 
     parser.add_argument("--eval-max-dets", type=int, default=500, help="评估时每张图最多保留的检测数 (默认: 500)")
 
@@ -437,13 +498,13 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(args=list(argv) if argv is not None else None)
 
 
-def get_model_from_factory(model_name: str, pretrain_weights: Optional[str] = None) -> Any:
+def get_model_from_factory(model_name: str, **model_kwargs: Any) -> Any:
     """
     从工厂函数获取模型实例。
 
     Args:
         model_name: 模型名称
-        pretrain_weights: 可选的初始化权重路径。
+        **model_kwargs: 传给模型配置的关键字参数。
 
     Returns:
         模型实例
@@ -452,7 +513,23 @@ def get_model_from_factory(model_name: str, pretrain_weights: Optional[str] = No
     if model_name not in factory:
         raise ValueError(f"不支持的模型: {model_name}, 支持的模型: {list(factory.keys())}")
 
-    return factory[model_name](layer_norm=True, pretrain_weights=pretrain_weights)
+    return factory[model_name](layer_norm=True, **model_kwargs)
+
+
+def prepare_model_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """准备模型构造参数，避免把架构字段传给 TrainConfig。"""
+    model_kwargs = {
+        # CLI 训练入口先在 CPU 上构造 RFDETR 外层模型，避免 DDP 多进程在
+        # Lightning 接管设备前全部抢占默认 CUDA 设备；实际训练设备由
+        # TrainConfig.device / strategy / devices 交给 Lightning 处理。
+        "device": "cpu",
+        "pretrain_weights": args.pretrain_weights,
+        "group_detr": args.group_detr,
+        "num_classes": args.num_classes,
+        "num_select": args.num_select,
+        "ia_bce_loss": args.ia_bce_loss,
+    }
+    return {k: v for k, v in model_kwargs.items() if v is not None}
 
 
 def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
@@ -473,6 +550,7 @@ def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "grad_accum_steps": args.grad_accum_steps,
         "resume": args.resume,
         "eval": args.eval,
+        "device": args.device,
         "lr": args.lr,
         "lr_encoder": args.lr_encoder,
         "weight_decay": args.weight_decay,
@@ -489,6 +567,9 @@ def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "ema_decay": args.ema_decay,
         "ema_tau": args.ema_tau,
         "ema_update_interval": args.ema_update_interval,
+        "auto_batch_target_effective": args.auto_batch_target_effective,
+        "auto_batch_max_targets_per_image": args.auto_batch_max_targets_per_image,
+        "auto_batch_ema_headroom": args.auto_batch_ema_headroom,
         "early_stopping": args.early_stopping,
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
@@ -508,11 +589,10 @@ def prepare_train_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
         "square_resize_div_64": args.square_resize_div_64,
         "do_random_resize_via_padding": args.do_random_resize_via_padding,
         "checkpoint_interval": args.checkpoint_interval,
-        "group_detr": args.group_detr,
-        "num_classes": args.num_classes,
-        "num_select": args.num_select,
-        "ia_bce_loss": args.ia_bce_loss,
         "cls_loss_coef": args.cls_loss_coef,
+        "strategy": args.strategy,
+        "devices": args.devices,
+        "num_nodes": args.num_nodes,
         "eval_max_dets": args.eval_max_dets,
         "eval_interval": args.eval_interval,
         "log_per_class_metrics": args.log_per_class_metrics,
@@ -642,7 +722,7 @@ def main():
     maybe_infer_num_classes(args, dataset_dir_arg)
 
     # 创建模型
-    model = get_model_from_factory(args.model)
+    model = get_model_from_factory(args.model, **prepare_model_kwargs(args))
 
     # 准备训练参数
     train_kwargs = prepare_train_kwargs(args)
