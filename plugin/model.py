@@ -50,16 +50,16 @@ class PluginRFDETR(RFDETR):
     def _load_classes(dataset_dir: Union[str, List[str]]) -> List[str]:
         """多目录类名加载和一致性校验。"""
         if isinstance(dataset_dir, str):
-            return RFDETR._load_classes_single(dataset_dir)
+            return RFDETR._load_classes(dataset_dir)
 
         dirs = list(dataset_dir)
         if not dirs:
             raise ValueError("dataset_dir list must not be empty")
 
-        reference_classes = RFDETR._load_classes_single(dirs[0])
+        reference_classes = RFDETR._load_classes(dirs[0])
 
         for d in dirs[1:]:
-            other_classes = RFDETR._load_classes_single(d)
+            other_classes = RFDETR._load_classes(d)
             if other_classes != reference_classes:
                 raise ValueError(
                     f"Class name mismatch across dataset directories.\n"
@@ -82,10 +82,12 @@ def create_plugin_model_factory():
     from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
     from rfdetr.detr import RFDETRBase
 
+    # RFDETRBase 在上游已 deprecated，并被 deprecate proxy 包装；继续动态多继承
+    # 会触发 metaclass conflict。base 保留为兼容入口，其余常用尺寸仍使用 Plugin。
     return {
         "nano": _make_plugin_variant("PluginRFDETRNano", RFDETRNano),
         "small": _make_plugin_variant("PluginRFDETRSmall", RFDETRSmall),
         "medium": _make_plugin_variant("PluginRFDETRMedium", RFDETRMedium),
         "large": _make_plugin_variant("PluginRFDETRLarge", RFDETRLarge),
-        "base": _make_plugin_variant("PluginRFDETRBase", RFDETRBase),
+        "base": RFDETRBase,
     }

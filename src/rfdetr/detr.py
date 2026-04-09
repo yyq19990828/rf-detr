@@ -790,8 +790,22 @@ class RFDETR:
         self.model.model = self.model.model.to(device)
 
     @staticmethod
-    def _load_classes(dataset_dir: str) -> list[str]:
+    def _load_classes(dataset_dir: str | list[str]) -> list[str]:
         """Load class names from a COCO or YOLO dataset directory."""
+        if isinstance(dataset_dir, list):
+            if not dataset_dir:
+                raise ValueError("dataset_dir list must not be empty")
+            reference_classes = RFDETR._load_classes(dataset_dir[0])
+            for other_dir in dataset_dir[1:]:
+                other_classes = RFDETR._load_classes(other_dir)
+                if other_classes != reference_classes:
+                    raise ValueError(
+                        "Class name mismatch across dataset directories. "
+                        f"{dataset_dir[0]!r} has {reference_classes}, "
+                        f"but {other_dir!r} has {other_classes}."
+                    )
+            return reference_classes
+
         if is_valid_coco_dataset(dataset_dir):
             coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
             with open(coco_path, encoding="utf-8") as f:
@@ -835,7 +849,7 @@ class RFDETR:
         )
 
     @staticmethod
-    def _detect_num_classes_for_training(dataset_dir: str) -> int:
+    def _detect_num_classes_for_training(dataset_dir: str | list[str]) -> int:
         """Detect the class count using the same category basis as training labels.
 
         For COCO-style datasets this counts all categories by ``id`` from
@@ -843,6 +857,20 @@ class RFDETR:
         ``coco.cats`` used by the training datamodule). For YOLO-style datasets
         it falls back to ``_load_classes``.
         """
+        if isinstance(dataset_dir, list):
+            if not dataset_dir:
+                raise ValueError("dataset_dir list must not be empty")
+            reference_count = RFDETR._detect_num_classes_for_training(dataset_dir[0])
+            for other_dir in dataset_dir[1:]:
+                other_count = RFDETR._detect_num_classes_for_training(other_dir)
+                if other_count != reference_count:
+                    raise ValueError(
+                        "Class count mismatch across dataset directories. "
+                        f"{dataset_dir[0]!r} has {reference_count} classes, "
+                        f"but {other_dir!r} has {other_count} classes."
+                    )
+            return reference_count
+
         if is_valid_coco_dataset(dataset_dir):
             coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
             with open(coco_path, encoding="utf-8") as f:
@@ -853,7 +881,7 @@ class RFDETR:
 
         return len(RFDETR._load_classes(dataset_dir))
 
-    def _align_num_classes_from_dataset(self, dataset_dir: str) -> None:
+    def _align_num_classes_from_dataset(self, dataset_dir: str | list[str]) -> None:
         """Auto-detect the dataset class count and align ``model_config.num_classes`` in-place.
 
         Must be called before ``RFDETRModelModule`` is constructed so that weight loading inside

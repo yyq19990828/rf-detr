@@ -30,7 +30,28 @@ __all__ = [
     "RFDETRSeg2XLarge",
 ]
 
-from deprecate import deprecated_class
+import functools
+import warnings
+
+try:
+    from deprecate import deprecated_class
+except ImportError:
+    from rfdetr.utilities.decorators import deprecated
+
+    def deprecated_class(**deprecated_kwargs):
+        """Compatibility shim for deprecate versions without ``deprecated_class``."""
+
+        def _decorate(cls):
+            kwargs = dict(deprecated_kwargs)
+            target = kwargs.pop("target", True)
+            cls.__init__ = deprecated(
+                target=target,
+                stream=functools.partial(warnings.warn, category=DeprecationWarning, stacklevel=2),
+                **kwargs,
+            )(cls.__init__)
+            return cls
+
+        return _decorate
 
 from rfdetr.config import (
     ModelConfig,
