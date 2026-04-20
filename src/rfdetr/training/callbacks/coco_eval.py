@@ -256,6 +256,25 @@ class COCOEvalCallback(Callback):
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _to_metric_device(value: torch.Tensor | float, pl_module: Any) -> torch.Tensor:
+        """Return a detached scalar tensor on the LightningModule device.
+
+        Lightning may attempt distributed reduction for callback/logged metrics.
+        Keep those scalars on the training device so DDP/NCCL does not receive a
+        CPU tensor during ``all_reduce``.
+
+        Args:
+            value: Metric value to normalize.
+            pl_module: The LightningModule providing the target device.
+
+        Returns:
+            A detached scalar tensor on ``pl_module.device``.
+        """
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(pl_module.device)
+        return torch.tensor(float(value), device=pl_module.device)
+
     def _compute_and_log(self, trainer: Any, pl_module: Any, split: str) -> None:
         """Shared epoch-end logic for validation and test evaluation loops.
 
@@ -274,6 +293,10 @@ class COCOEvalCallback(Callback):
         pfx = "bbox_" if self._segmentation else ""
         mar_key = f"{pfx}mar_{self._max_dets}"
         sync_dist = bool(getattr(trainer, "world_size", 1) > 1)
+        map_50_95 = self._to_metric_device(metrics[f"{pfx}map"], pl_module)
+        map_50 = self._to_metric_device(metrics[f"{pfx}map_50"], pl_module)
+        map_75 = self._to_metric_device(metrics[f"{pfx}map_75"], pl_module)
+        mar = self._to_metric_device(metrics[mar_key], pl_module)
 
         overall: dict[str, float] = {
             "mAP 50:95": float(metrics[f"{pfx}map"]),
@@ -282,45 +305,50 @@ class COCOEvalCallback(Callback):
             f"mAR @{self._max_dets}": float(metrics[mar_key]),
         }
 
-        pl_module.log(f"{split}/mAP_50_95", metrics[f"{pfx}map"], prog_bar=True, sync_dist=sync_dist)
-        pl_module.log(f"{split}/mAP_50", metrics[f"{pfx}map_50"], prog_bar=True, sync_dist=sync_dist)
-        pl_module.log(f"{split}/mAP_75", metrics[f"{pfx}map_75"], sync_dist=sync_dist)
-        pl_module.log(f"{split}/mAR", metrics[mar_key], sync_dist=sync_dist)
+        pl_module.log(f"{split}/mAP_50_95", map_50_95, prog_bar=True, sync_dist=sync_dist)
+        pl_module.log(f"{split}/mAP_50", map_50, prog_bar=True, sync_dist=sync_dist)
+        pl_module.log(f"{split}/mAP_75", map_75, sync_dist=sync_dist)
+        pl_module.log(f"{split}/mAR", mar, sync_dist=sync_dist)
 
         # Write directly into callback_metrics so ModelCheckpoint / EarlyStopping
         # read fresh values each epoch.  pl_module.log() from a callback's
         # on_*_epoch_end goes only to logged_metrics (external loggers), not to
         # callback_metrics, so checkpointing would see stale values otherwise.
-        trainer.callback_metrics[f"{split}/mAP_50_95"] = metrics[f"{pfx}map"].detach().cpu()
-        trainer.callback_metrics[f"{split}/mAP_50"] = metrics[f"{pfx}map_50"].detach().cpu()
-        trainer.callback_metrics[f"{split}/mAP_75"] = metrics[f"{pfx}map_75"].detach().cpu()
-        trainer.callback_metrics[f"{split}/mAR"] = metrics[mar_key].detach().cpu()
+        trainer.callback_metrics[f"{split}/mAP_50_95"] = map_50_95
+        trainer.callback_metrics[f"{split}/mAP_50"] = map_50
+        trainer.callback_metrics[f"{split}/mAP_75"] = map_75
+        trainer.callback_metrics[f"{split}/mAR"] = mar
 
         # EMA metrics — computed from a separate EMA forward pass accumulated
         # in on_validation_batch_end, so base and EMA values are independent.
         if self.map_metric_ema is not None:
             ema_metrics = self.map_metric_ema.compute()
             ema_mar_key = f"{pfx}mar_{self._max_dets}"
-            pl_module.log(f"{split}/ema_mAP_50_95", ema_metrics[f"{pfx}map"], prog_bar=True, sync_dist=sync_dist)
-            pl_module.log(f"{split}/ema_mAP_50", ema_metrics[f"{pfx}map_50"], sync_dist=sync_dist)
-            pl_module.log(f"{split}/ema_mAR", ema_metrics[ema_mar_key], sync_dist=sync_dist)
-            trainer.callback_metrics[f"{split}/ema_mAP_50_95"] = ema_metrics[f"{pfx}map"].detach().cpu()
-            trainer.callback_metrics[f"{split}/ema_mAP_50"] = ema_metrics[f"{pfx}map_50"].detach().cpu()
-            trainer.callback_metrics[f"{split}/ema_mAR"] = ema_metrics[ema_mar_key].detach().cpu()
+            ema_map_50_95 = self._to_metric_device(ema_metrics[f"{pfx}map"], pl_module)
+            ema_map_50 = self._to_metric_device(ema_metrics[f"{pfx}map_50"], pl_module)
+            ema_mar = self._to_metric_device(ema_metrics[ema_mar_key], pl_module)
+            pl_module.log(f"{split}/ema_mAP_50_95", ema_map_50_95, prog_bar=True, sync_dist=sync_dist)
+            pl_module.log(f"{split}/ema_mAP_50", ema_map_50, sync_dist=sync_dist)
+            pl_module.log(f"{split}/ema_mAR", ema_mar, sync_dist=sync_dist)
+            trainer.callback_metrics[f"{split}/ema_mAP_50_95"] = ema_map_50_95
+            trainer.callback_metrics[f"{split}/ema_mAP_50"] = ema_map_50
+            trainer.callback_metrics[f"{split}/ema_mAR"] = ema_mar
             self.map_metric_ema.reset()
 
         if self._segmentation:
             overall["segm mAP 50:95"] = float(metrics["segm_map"])
             overall["segm mAP 50"] = float(metrics["segm_map_50"])
-            pl_module.log(f"{split}/segm_mAP_50_95", metrics["segm_map"], sync_dist=sync_dist)
-            pl_module.log(f"{split}/segm_mAP_50", metrics["segm_map_50"], sync_dist=sync_dist)
-            trainer.callback_metrics[f"{split}/segm_mAP_50_95"] = metrics["segm_map"].detach().cpu()
-            trainer.callback_metrics[f"{split}/segm_mAP_50"] = metrics["segm_map_50"].detach().cpu()
+            segm_map_50_95 = self._to_metric_device(metrics["segm_map"], pl_module)
+            segm_map_50 = self._to_metric_device(metrics["segm_map_50"], pl_module)
+            pl_module.log(f"{split}/segm_mAP_50_95", segm_map_50_95, sync_dist=sync_dist)
+            pl_module.log(f"{split}/segm_mAP_50", segm_map_50, sync_dist=sync_dist)
+            trainer.callback_metrics[f"{split}/segm_mAP_50_95"] = segm_map_50_95
+            trainer.callback_metrics[f"{split}/segm_mAP_50"] = segm_map_50
             if self._has_ema_callback(trainer):
-                pl_module.log(f"{split}/ema_segm_mAP_50_95", metrics["segm_map"], sync_dist=sync_dist)
-                pl_module.log(f"{split}/ema_segm_mAP_50", metrics["segm_map_50"], sync_dist=sync_dist)
-                trainer.callback_metrics[f"{split}/ema_segm_mAP_50_95"] = metrics["segm_map"].detach().cpu()
-                trainer.callback_metrics[f"{split}/ema_segm_mAP_50"] = metrics["segm_map_50"].detach().cpu()
+                pl_module.log(f"{split}/ema_segm_mAP_50_95", segm_map_50_95, sync_dist=sync_dist)
+                pl_module.log(f"{split}/ema_segm_mAP_50", segm_map_50, sync_dist=sync_dist)
+                trainer.callback_metrics[f"{split}/ema_segm_mAP_50_95"] = segm_map_50_95
+                trainer.callback_metrics[f"{split}/ema_segm_mAP_50"] = segm_map_50
 
         # F1 sweep — run first so per-class F1/prec/rec are available when
         # building the unified per-class table rows below.
@@ -336,12 +364,15 @@ class COCOEvalCallback(Callback):
             overall["F1"] = float(best["macro_f1"])
             overall["Precision"] = float(best["macro_precision"])
             overall["Recall"] = float(best["macro_recall"])
-            pl_module.log(f"{split}/F1", float(best["macro_f1"]), prog_bar=True, sync_dist=sync_dist)
-            pl_module.log(f"{split}/precision", float(best["macro_precision"]), sync_dist=sync_dist)
-            pl_module.log(f"{split}/recall", float(best["macro_recall"]), sync_dist=sync_dist)
-            trainer.callback_metrics[f"{split}/F1"] = torch.tensor(float(best["macro_f1"]))
-            trainer.callback_metrics[f"{split}/precision"] = torch.tensor(float(best["macro_precision"]))
-            trainer.callback_metrics[f"{split}/recall"] = torch.tensor(float(best["macro_recall"]))
+            f1 = self._to_metric_device(float(best["macro_f1"]), pl_module)
+            precision = self._to_metric_device(float(best["macro_precision"]), pl_module)
+            recall = self._to_metric_device(float(best["macro_recall"]), pl_module)
+            pl_module.log(f"{split}/F1", f1, prog_bar=True, sync_dist=sync_dist)
+            pl_module.log(f"{split}/precision", precision, sync_dist=sync_dist)
+            pl_module.log(f"{split}/recall", recall, sync_dist=sync_dist)
+            trainer.callback_metrics[f"{split}/F1"] = f1
+            trainer.callback_metrics[f"{split}/precision"] = precision
+            trainer.callback_metrics[f"{split}/recall"] = recall
             for k, cid in enumerate(sorted_ids):
                 f1_by_cid[cid] = {
                     "f1": float(best["per_class_f1"][k]),
@@ -352,12 +383,15 @@ class COCOEvalCallback(Callback):
             overall["F1"] = 0.0
             overall["Precision"] = 0.0
             overall["Recall"] = 0.0
-            pl_module.log(f"{split}/F1", 0.0, prog_bar=True, sync_dist=sync_dist)
-            pl_module.log(f"{split}/precision", 0.0, sync_dist=sync_dist)
-            pl_module.log(f"{split}/recall", 0.0, sync_dist=sync_dist)
-            trainer.callback_metrics[f"{split}/F1"] = torch.tensor(0.0)
-            trainer.callback_metrics[f"{split}/precision"] = torch.tensor(0.0)
-            trainer.callback_metrics[f"{split}/recall"] = torch.tensor(0.0)
+            f1 = self._to_metric_device(0.0, pl_module)
+            precision = self._to_metric_device(0.0, pl_module)
+            recall = self._to_metric_device(0.0, pl_module)
+            pl_module.log(f"{split}/F1", f1, prog_bar=True, sync_dist=sync_dist)
+            pl_module.log(f"{split}/precision", precision, sync_dist=sync_dist)
+            pl_module.log(f"{split}/recall", recall, sync_dist=sync_dist)
+            trainer.callback_metrics[f"{split}/F1"] = f1
+            trainer.callback_metrics[f"{split}/precision"] = precision
+            trainer.callback_metrics[f"{split}/recall"] = recall
 
         # torchmetrics returns `classes` as a 0-d scalar when only one class is
         # present in the batch.  Ensure it is always 1-d before iterating.
@@ -443,7 +477,7 @@ class COCOEvalCallback(Callback):
                 continue
             idx = int(class_id)
             name = self._cat_id_to_name.get(idx, str(idx))
-            pl_module.log(f"{split}/AP/{name}", ap, sync_dist=sync_dist)
+            pl_module.log(f"{split}/AP/{name}", self._to_metric_device(ap, pl_module), sync_dist=sync_dist)
             row: dict[str, Any] = {"name": name, "ap": ap_f, "ar": ar_f}
             row.update(f1_by_cid.get(idx, {"f1": float("nan"), "precision": float("nan"), "recall": float("nan")}))
             per_class.append(row)

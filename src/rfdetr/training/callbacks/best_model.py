@@ -460,5 +460,5 @@ class RFDETREarlyStopping(EarlyStopping):
         else:
             effective = regular_val  # type: ignore[assignment]
 
-        trainer.callback_metrics[self._SYNTHETIC_MONITOR] = torch.tensor(effective)
+        trainer.callback_metrics[self._SYNTHETIC_MONITOR] = torch.tensor(effective, device=pl_module.device)
         super().on_validation_end(trainer, pl_module)
