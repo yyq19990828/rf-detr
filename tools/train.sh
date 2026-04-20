@@ -108,6 +108,7 @@ SQUARE_RESIZE_DIV_64="${SQUARE_RESIZE_DIV_64:-1}"
 DO_RANDOM_RESIZE_VIA_PADDING="${DO_RANDOM_RESIZE_VIA_PADDING:-0}"
 SYNC_BN="${SYNC_BN:-0}"
 FP16_EVAL="${FP16_EVAL:-0}"
+TRAIN_LOG_SYNC_DIST="${TRAIN_LOG_SYNC_DIST:-1}"
 
 PROJECT="${PROJECT:-}"
 RUN="${RUN:-}"
@@ -197,6 +198,11 @@ fi
 if [[ "${IA_BCE_LOSS}" == "1" ]]; then TRAIN_ARGS+=(--ia-bce-loss); else TRAIN_ARGS+=(--no-ia-bce-loss); fi
 if [[ "${SYNC_BN}" == "1" ]]; then TRAIN_ARGS+=(--sync-bn); else TRAIN_ARGS+=(--no-sync-bn); fi
 if [[ "${FP16_EVAL}" == "1" ]]; then TRAIN_ARGS+=(--fp16-eval); else TRAIN_ARGS+=(--no-fp16-eval); fi
+if [[ "${TRAIN_LOG_SYNC_DIST}" == "1" ]]; then
+  TRAIN_ARGS+=(--train-log-sync-dist)
+else
+  TRAIN_ARGS+=(--no-train-log-sync-dist)
+fi
 
 echo "Training command:"
 printf ' %q' uv run --no-sync python tools/train.py "${TRAIN_ARGS[@]}"
