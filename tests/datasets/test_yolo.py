@@ -14,15 +14,14 @@ import pytest
 import supervision as sv
 import torch
 from PIL import Image
+from pycocotools.coco import COCO
 
 from rfdetr.datasets import build_dataset, get_coco_api_from_dataset
 from rfdetr.datasets.yolo import (
-    CocoLikeAPI,
     ConvertYolo,
     YoloDetection,
     _extract_yolo_class_names,
     _LazyYoloDetectionDataset,
-    _MockSvDataset,
     is_valid_yolo_dataset,
 )
 
@@ -40,302 +39,6 @@ def _write_yolo_segmentation_dataset(tmp_path: Path) -> tuple[Path, Path, Path]:
     data_file = tmp_path / "data.yaml"
     data_file.write_text("names:\n  0: carton\n", encoding="utf-8")
     return image_dir, label_dir, data_file
-
-
-class TestCocoLikeAPI:
-    """Tests for the CocoLikeAPI class."""
-
-    @pytest.fixture
-    def coco_api(self):
-        """Fixture to create a test instance of CocoLikeAPI."""
-        mock = _MockSvDataset()
-        sizes = {"img_0.jpg": (100, 100), "img_1.jpg": (100, 100)}
-        return CocoLikeAPI(mock.classes, mock, sizes)
-
-    def test_initialization(self, coco_api):
-        """Test that the API initializes correctly."""
-        assert coco_api is not None
-        assert hasattr(coco_api, "dataset")
-        assert hasattr(coco_api, "imgs")
-        assert hasattr(coco_api, "anns")
-        assert hasattr(coco_api, "cats")
-        assert hasattr(coco_api, "imgToAnns")
-        assert hasattr(coco_api, "catToImgs")
-
-    def test_dataset_structure(self, coco_api):
-        """Test the structure of the COCO dataset."""
-        assert "info" in coco_api.dataset
-        assert "images" in coco_api.dataset
-        assert "annotations" in coco_api.dataset
-        assert "categories" in coco_api.dataset
-
-    @pytest.mark.parametrize(
-        "dataset_part, expected_count",
-        [
-            ("images", 2),
-            ("categories", 2),
-            ("annotations", 2),
-        ],
-    )
-    def test_dataset_counts(self, coco_api, dataset_part, expected_count):
-        """Test the number of images, categories, and annotations in the dataset."""
-        assert len(coco_api.dataset[dataset_part]) == expected_count
-
-    @pytest.mark.parametrize(
-        "img_ids, expected_ids",
-        [
-            (None, [0, 1]),
-            ([0], [0]),
-            ([1], [1]),
-            ([0, 1], [0, 1]),
-        ],
-    )
-    def test_get_img_ids_by_img_ids(self, coco_api, img_ids, expected_ids):
-        """Test getImgIds method with various image ID filters."""
-        result = coco_api.getImgIds(imgIds=img_ids)
-        assert sorted(result) == sorted(expected_ids)
-
-    @pytest.mark.parametrize(
-        "cat_ids, expected_img_ids",
-        [
-            (None, [0, 1]),
-            ([0], [0]),
-            ([1], [1]),
-            ([0, 1], [0, 1]),
-        ],
-    )
-    def test_get_img_ids_by_cat_ids(self, coco_api, cat_ids, expected_img_ids):
-        """Test getImgIds method with various category ID filters."""
-        result = coco_api.getImgIds(catIds=cat_ids)
-        assert sorted(result) == sorted(expected_img_ids)
-
-    @pytest.mark.parametrize(
-        "cat_names, expected_ids",
-        [
-            (None, [0, 1]),
-            (["cat"], [0]),
-            (["dog"], [1]),
-            (["cat", "dog"], [0, 1]),
-        ],
-    )
-    def test_get_cat_ids_by_names(self, coco_api, cat_names, expected_ids):
-        """Test getCatIds method with various category name filters."""
-        result = coco_api.getCatIds(catNms=cat_names)
-        assert sorted(result) == sorted(expected_ids)
-
-    @pytest.mark.parametrize(
-        "cat_ids, expected_ids",
-        [
-            (None, [0, 1]),
-            ([0], [0]),
-            ([1], [1]),
-            ([0, 1], [0, 1]),
-        ],
-    )
-    def test_get_cat_ids_by_ids(self, coco_api, cat_ids, expected_ids):
-        """Test getCatIds method with various category ID filters."""
-        result = coco_api.getCatIds(catIds=cat_ids)
-        assert sorted(result) == sorted(expected_ids)
-
-    @pytest.mark.parametrize(
-        "img_ids, cat_ids, expected_ids",
-        [
-            (None, None, [0, 1]),
-            ([0], None, [0]),
-            (None, [1], [1]),
-            ([0], [0], [0]),
-        ],
-    )
-    def test_get_ann_ids(self, coco_api, img_ids, cat_ids, expected_ids):
-        """Test getAnnIds method with various filter conditions."""
-        result = coco_api.getAnnIds(imgIds=img_ids, catIds=cat_ids)
-        assert sorted(result) == sorted(expected_ids)
-
-    @pytest.mark.parametrize(
-        "ann_ids, expected_length",
-        [
-            ([0], 1),
-            ([1], 1),
-            ([0, 1], 2),
-        ],
-    )
-    def test_load_anns(self, coco_api, ann_ids, expected_length):
-        """Test loadAnns method with various annotation IDs."""
-        result = coco_api.loadAnns(ann_ids)
-        assert len(result) == expected_length
-        assert all(ann["id"] in ann_ids for ann in result)
-
-    @pytest.mark.parametrize(
-        "cat_ids, expected_length",
-        [
-            ([0], 1),
-            ([1], 1),
-            ([0, 1], 2),
-            (None, 2),
-        ],
-    )
-    def test_load_cats(self, coco_api, cat_ids, expected_length):
-        """Test loadCats method with various category IDs."""
-        result = coco_api.loadCats(cat_ids)
-        assert len(result) == expected_length
-        if cat_ids is not None:
-            assert all(cat["id"] in cat_ids for cat in result)
-
-    @pytest.mark.parametrize(
-        "img_ids, expected_length",
-        [
-            ([0], 1),
-            ([1], 1),
-            ([0, 1], 2),
-        ],
-    )
-    def test_load_imgs(self, coco_api, img_ids, expected_length):
-        """Test loadImgs method with various image IDs."""
-        result = coco_api.loadImgs(img_ids)
-        assert len(result) == expected_length
-        assert all(img["id"] in img_ids for img in result)
-
-    def test_img_to_anns(self, coco_api):
-        """Test the imgToAnns index."""
-        assert len(coco_api.imgToAnns[0]) == 1
-        assert len(coco_api.imgToAnns[1]) == 1
-        assert coco_api.imgToAnns[0][0]["id"] == 0
-        assert coco_api.imgToAnns[1][0]["id"] == 1
-
-    def test_cat_to_imgs(self, coco_api):
-        """Test the catToImgs index."""
-        assert len(coco_api.catToImgs[0]) == 1
-        assert len(coco_api.catToImgs[1]) == 1
-        assert 0 in coco_api.catToImgs[0]
-        assert 1 in coco_api.catToImgs[1]
-
-    @pytest.mark.parametrize("ann_id", [0, 1])
-    def test_annotation_format(self, coco_api, ann_id):
-        """Test that annotations are in the correct format."""
-        ann = coco_api.loadAnns([ann_id])[0]
-
-        # Check required fields
-        required_fields = ["id", "image_id", "category_id", "bbox", "area", "iscrowd"]
-        for field in required_fields:
-            assert field in ann, f"Annotation missing required field: {field}"
-
-        # Check bbox format
-        assert len(ann["bbox"]) == 4, "BBox must have 4 coordinates"
-        assert all(isinstance(x, (int, float)) for x in ann["bbox"]), "BBox coordinates must be numeric"
-
-        # Check area
-        assert isinstance(ann["area"], (int, float)), "Area must be numeric"
-        assert ann["area"] > 0, "Area must be positive"
-
-        # Check iscrowd
-        assert ann["iscrowd"] in [0, 1], "iscrowd must be 0 or 1"
-
-    @pytest.mark.parametrize("cat_id", [0, 1])
-    def test_category_format(self, coco_api, cat_id):
-        """Test that categories are in the correct format."""
-        cat = coco_api.loadCats([cat_id])[0]
-
-        # Check required fields
-        required_fields = ["id", "name", "supercategory"]
-        for field in required_fields:
-            assert field in cat, f"Category missing required field: {field}"
-
-        # Check field types
-        assert isinstance(cat["id"], int), "Category ID must be an integer"
-        assert isinstance(cat["name"], str), "Category name must be a string"
-        assert isinstance(cat["supercategory"], str), "Supercategory must be a string"
-
-    @pytest.mark.parametrize("img_id", [0, 1])
-    def test_image_format(self, coco_api, img_id):
-        """Test that images are in the correct format."""
-        img = coco_api.loadImgs([img_id])[0]
-
-        # Check required fields
-        required_fields = ["id", "file_name", "width", "height"]
-        for field in required_fields:
-            assert field in img, f"Image missing required field: {field}"
-
-        # Check field types
-        assert isinstance(img["id"], int), "Image ID must be an integer"
-        assert isinstance(img["file_name"], str), "File name must be a string"
-        assert isinstance(img["width"], int), "Width must be an integer"
-        assert isinstance(img["height"], int), "Height must be an integer"
-
-    def test_empty_annotations(self):
-        """Test handling of images with no annotations."""
-
-        class EmptyMockDataset(_MockSvDataset):
-            def __init__(self):
-                super().__init__()
-                self.image_paths = ["img_0.jpg"]
-                self.annotations = {
-                    "img_0.jpg": sv.Detections(xyxy=np.empty((0, 4)), class_id=np.array([])),
-                }
-
-        sizes = {"img_0.jpg": (100, 100)}
-        api = CocoLikeAPI(["cat"], EmptyMockDataset(), sizes)
-        assert len(api.dataset["annotations"]) == 0
-        assert len(api.getAnnIds()) == 0
-
-    def test_images_with_multiple_annotations(self):
-        """Test handling of images with multiple annotations per image."""
-
-        class MultiAnnotationMockDataset(_MockSvDataset):
-            def __init__(self):
-                super().__init__()
-                self.image_paths = ["img_0.jpg", "img_1.jpg"]
-                self.annotations = {
-                    "img_0.jpg": sv.Detections(
-                        xyxy=np.array([[10, 20, 30, 40], [50, 60, 70, 80]]), class_id=np.array([0, 1])
-                    ),
-                    "img_1.jpg": sv.Detections(xyxy=np.array([[15, 25, 35, 45]]), class_id=np.array([0])),
-                }
-
-        sizes = {"img_0.jpg": (100, 100), "img_1.jpg": (100, 100)}
-        api = CocoLikeAPI(["cat", "dog"], MultiAnnotationMockDataset(), sizes)
-
-        # Verify 3 annotations in total
-        assert len(api.dataset["annotations"]) == 3
-
-        # Verify annotations per image
-        assert len(api.imgToAnns[0]) == 2
-        assert len(api.imgToAnns[1]) == 1
-
-        # Verify image IDs per category
-        assert 0 in api.catToImgs[0]
-        assert 1 in api.catToImgs[0]
-        assert 0 in api.catToImgs[1]
-
-    def test_normalized_boxes_are_scaled_to_pixel_coordinates(self) -> None:
-        """Normalized YOLO boxes must be converted to pixel-space COCO boxes."""
-
-        class NormalizedMockDataset:
-            classes = ["car"]
-
-            def __init__(self):
-                self.image_paths = ["img_norm.jpg"]
-                self.annotations = {
-                    "img_norm.jpg": sv.Detections(
-                        xyxy=np.array([[0.25, 0.20, 0.75, 0.60]], dtype=np.float32),
-                        class_id=np.array([0], dtype=np.int64),
-                    )
-                }
-
-            def __len__(self) -> int:
-                return 1
-
-        api = CocoLikeAPI(
-            ["car"],
-            NormalizedMockDataset(),
-            {"img_norm.jpg": (200, 100)},
-            normalized_coords=True,
-        )
-
-        ann = api.loadAnns([0])[0]
-
-        assert ann["bbox"] == pytest.approx([50.0, 20.0, 100.0, 40.0])
-        assert ann["area"] == pytest.approx(4000.0)
-        assert api.getAnnIds(areaRng=[32**2, 96**2]) == [0]
 
 
 class TestBuildRoboflowFromYoloAugConfig:
@@ -412,6 +115,27 @@ class TestBuildRoboflowFromYoloAugConfig:
         _, kwargs = mock_dataset.call_args
         assert kwargs["data_file"] == str(tmp_path / "data.yml")
 
+    def test_auto_no_cuda_sets_gpu_postprocess_false(self) -> None:
+        """auto + no CUDA must keep CPU normalize by passing gpu_postprocess=False."""
+        args = self._make_args(square_resize_div_64=False, aug_config=None)
+        args.augmentation_backend = "auto"
+        with (
+            patch("rfdetr.datasets.yolo.Path") as mock_path,
+            patch("rfdetr.datasets.yolo.make_coco_transforms") as mock_transform,
+            patch("rfdetr.datasets.yolo.YoloDetection") as mock_dataset,
+            patch("rfdetr.datasets.kornia_transforms._has_cuda_device", return_value=False),
+        ):
+            mock_path.return_value.exists.return_value = True
+            mock_transform.return_value = MagicMock()
+            mock_dataset.return_value = MagicMock()
+
+            from rfdetr.datasets.yolo import build_roboflow_from_yolo
+
+            build_roboflow_from_yolo("train", args, resolution=640)
+
+        _, kwargs = mock_transform.call_args
+        assert kwargs["gpu_postprocess"] is False
+
 
 class TestIsValidYoloDataset:
     """Tests for the is_valid_yolo_dataset function."""
@@ -447,166 +171,6 @@ class TestIsValidYoloDataset:
         """Dataset without required split directories should be invalid."""
         (tmp_path / "data.yaml").touch()
         assert is_valid_yolo_dataset(str(tmp_path)) is False
-
-
-class TestLoadYoloAnnotationsCached:
-    """Tests for load_yolo_annotations_cached with v5 cache optimizations."""
-
-    @staticmethod
-    def _create_dataset(tmp_path: Path, num_images: int = 3) -> tuple[Path, Path, Path]:
-        """Create a minimal YOLO dataset on disk for cache testing.
-
-        Returns:
-            Tuple of (images_dir, labels_dir, data_yaml_path).
-        """
-        images_dir = tmp_path / "images"
-        labels_dir = tmp_path / "labels"
-        images_dir.mkdir()
-        labels_dir.mkdir()
-
-        data_yaml = tmp_path / "data.yaml"
-        data_yaml.write_text("names:\n  0: cat\n  1: dog\n")
-
-        for i in range(num_images):
-            # Create a small valid PNG image
-            img = Image.new("RGB", (80 + i, 60 + i), color=(i * 40, 100, 200))
-            img.save(images_dir / f"img_{i:03d}.png")
-
-            # Create a matching YOLO label
-            labels_dir.joinpath(f"img_{i:03d}.txt").write_text(f"0 0.5 0.5 0.4 0.3\n{1} 0.2 0.2 0.1 0.1\n")
-
-        return images_dir, labels_dir, data_yaml
-
-    def test_cache_written_and_loaded(self, tmp_path: Path) -> None:
-        """First call writes .cache; second call loads from it with image_sizes."""
-        from rfdetr.datasets.yolo import load_yolo_annotations_cached
-
-        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path)
-        cache_file = labels_dir / ".cache"
-
-        # First call – full scan, writes cache
-        ds1, sizes1 = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-        assert cache_file.exists()
-        assert len(ds1) == 3
-        assert len(sizes1) == 3
-
-        # Second call – should load from cache
-        ds2, sizes2 = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-        assert len(ds2) == 3
-        assert sizes2 == sizes1
-
-    def test_image_sizes_are_real_dimensions(self, tmp_path: Path) -> None:
-        """image_sizes should contain real (width, height) from image headers."""
-        from rfdetr.datasets.yolo import load_yolo_annotations_cached
-
-        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=2)
-
-        _, sizes = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-
-        for path, (w, h) in sizes.items():
-            assert w > 0 and h > 0, f"Expected positive dims, got ({w}, {h})"
-            # Verify against actual image
-            with Image.open(path) as img:
-                assert (w, h) == img.size
-
-    def test_corrupt_image_excluded(self, tmp_path: Path) -> None:
-        """Corrupt images should be excluded via Image.verify() during scan."""
-        from rfdetr.datasets.yolo import load_yolo_annotations_cached
-
-        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=2)
-
-        # Corrupt one image
-        corrupt_img = images_dir / "img_000.png"
-        corrupt_img.write_bytes(b"not a valid image at all")
-
-        ds, sizes = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-
-        # Only 1 valid image should remain
-        assert len(ds) == 1
-        assert len(sizes) == 1
-        assert str(corrupt_img) not in sizes
-
-    def test_cache_stale_after_new_image(self, tmp_path: Path) -> None:
-        """Adding a new image should invalidate the cache and trigger rescan."""
-        from rfdetr.datasets.yolo import load_yolo_annotations_cached
-
-        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=2)
-
-        # Build cache with 2 images
-        ds1, _ = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-        assert len(ds1) == 2
-
-        # Add a third image + label
-        img = Image.new("RGB", (100, 100))
-        img.save(images_dir / "img_new.png")
-        (labels_dir / "img_new.txt").write_text("0 0.5 0.5 0.2 0.2\n")
-
-        # Should rescan and find 3 images
-        ds2, sizes2 = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-        assert len(ds2) == 3
-        assert len(sizes2) == 3
-
-    def test_cache_stale_after_dataset_is_copied_to_new_root(self, tmp_path: Path) -> None:
-        """A copied dataset should not reuse cached absolute image paths from the source root."""
-        from rfdetr.datasets.yolo import load_yolo_annotations_cached
-
-        source_root = tmp_path / "source"
-        target_root = tmp_path / "target"
-        source_root.mkdir()
-
-        images_dir, labels_dir, data_yaml = self._create_dataset(source_root, num_images=2)
-
-        ds1, _ = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-        assert all(path.startswith(str(images_dir)) for path in ds1.image_paths)
-
-        shutil.copytree(source_root, target_root)
-
-        target_images_dir = target_root / "images"
-        target_labels_dir = target_root / "labels"
-        target_data_yaml = target_root / "data.yaml"
-
-        ds2, sizes2 = load_yolo_annotations_cached(
-            str(target_images_dir),
-            str(target_labels_dir),
-            str(target_data_yaml),
-        )
-
-        assert len(ds2) == 2
-        assert len(sizes2) == 2
-        assert all(path.startswith(str(target_images_dir)) for path in ds2.image_paths)
-
-    def test_cache_contains_image_sizes_key(self, tmp_path: Path) -> None:
-        """The serialized cache dict must contain an 'image_sizes' key."""
-        import pickle
-
-        from rfdetr.datasets.yolo import load_yolo_annotations_cached
-
-        images_dir, labels_dir, data_yaml = self._create_dataset(tmp_path, num_images=1)
-        load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(data_yaml))
-
-        cache_data = pickle.loads((labels_dir / ".cache").read_bytes())
-        assert "image_sizes" in cache_data
-        assert len(cache_data["image_sizes"]) == 1
-
-    def test_missing_label_gets_empty_detections(self, tmp_path: Path) -> None:
-        """Images without a matching label file should get empty detections."""
-        from rfdetr.datasets.yolo import load_yolo_annotations_cached
-
-        images_dir = tmp_path / "images"
-        labels_dir = tmp_path / "labels"
-        images_dir.mkdir()
-        labels_dir.mkdir()
-        (tmp_path / "data.yaml").write_text("names:\n  0: thing\n")
-
-        # Create image but no label
-        img = Image.new("RGB", (50, 50))
-        img.save(images_dir / "lonely.png")
-
-        ds, sizes = load_yolo_annotations_cached(str(images_dir), str(labels_dir), str(tmp_path / "data.yaml"))
-        assert len(ds) == 1
-        assert len(sizes) == 1
-        path = ds.image_paths[0]
-        assert len(ds.annotations[path]) == 0
 
 
 class TestMultiDirYoloDataset:
@@ -663,7 +227,7 @@ class TestMultiDirYoloDataset:
 
 class TestConvertYoloRobustness:
     def test_convert_yolo_filters_non_finite_boxes(self) -> None:
-        converter = ConvertYolo(include_masks=False, normalized_coords=False)
+        converter = ConvertYolo(include_masks=False)
         image = Image.new("RGB", (100, 100))
         detections = sv.Detections(
             xyxy=np.array([[10.0, 10.0, 30.0, 30.0], [5.0, 5.0, np.nan, 20.0]], dtype=np.float32),
@@ -674,33 +238,6 @@ class TestConvertYoloRobustness:
 
         assert target["boxes"].shape == (1, 4)
         assert target["labels"].tolist() == [0]
-
-
-class TestYoloDetectionRobustness:
-    def test_getitem_retries_on_invalid_zero_sized_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        dataset = YoloDetection.__new__(YoloDetection)
-        dataset.ids = [10, 11]
-        dataset._transforms = None
-        dataset.prepare = lambda img, target: (img, target)
-
-        class _MockSvDataset:
-            def __len__(self) -> int:
-                return 2
-
-            def __getitem__(self, idx: int):
-                if idx == 0:
-                    bad_image = np.zeros((0, 100, 3), dtype=np.uint8)
-                    return "bad.jpg", bad_image, sv.Detections.empty()
-                good_image = np.zeros((100, 100, 3), dtype=np.uint8)
-                return "good.jpg", good_image, sv.Detections.empty()
-
-        dataset.sv_dataset = _MockSvDataset()
-        monkeypatch.setattr("random.randint", lambda _a, _b: 1)
-
-        image, target = dataset[0]
-
-        assert image.size == (100, 100)
-        assert target["image_id"] == 11
 
 
 class TestYoloDetectionLazyMasks:
@@ -728,6 +265,31 @@ class TestYoloDetectionLazyMasks:
             {"id": 0, "file_name": str(image_dir / "sample.png"), "height": 6, "width": 8}
         ]
         assert dataset.coco.dataset["annotations"][0]["segmentation"] == []
+        assert isinstance(dataset.coco, COCO)
+
+    def test_detection_init_exposes_real_coco_api_indexes(self, tmp_path: Path) -> None:
+        """`dataset.coco` should be a real pycocotools.COCO object with working indexes."""
+        image_dir = tmp_path / "images"
+        label_dir = tmp_path / "labels"
+        image_dir.mkdir()
+        label_dir.mkdir()
+        Image.new("RGB", (8, 6), color=(255, 255, 255)).save(image_dir / "sample.png")
+        (label_dir / "sample.txt").write_text("0 0.5 0.5 0.5 0.5\n", encoding="utf-8")
+        data_file = tmp_path / "data.yaml"
+        data_file.write_text("names:\n  - carton\n", encoding="utf-8")
+
+        dataset = YoloDetection(
+            img_folder=str(image_dir),
+            lb_folder=str(label_dir),
+            data_file=str(data_file),
+            transforms=None,
+            include_masks=False,
+        )
+
+        assert isinstance(dataset.coco, COCO)
+        assert dataset.coco.getCatIds() == [0]
+        assert dataset.coco.getImgIds() == [0]
+        assert dataset.coco.getAnnIds(imgIds=[0], catIds=[0]) == [0]
 
     def test_segmentation_masks_are_materialized_per_sample_fetch(self, tmp_path: Path) -> None:
         """Fetching a sample should create the dense boolean mask tensor expected downstream."""
