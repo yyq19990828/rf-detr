@@ -1,0 +1,21 @@
+stages:
+  - sync
+
+variables:
+  GITHUB_MIRROR_URL: "https://github.com/yyq19990828/rf-detr.git"
+  GITLAB_MIRROR_URL: "http://yangyiqing:${GITLAB_PAT}@192.168.2.10:82/perception/rf-detr.git"
+
+sync-from-github:
+  stage: sync
+  tags:
+    - docker
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  only:
+    - schedules
+  script:
+    - git clone --bare "${GITHUB_MIRROR_URL}" /tmp/rf-detr-mirror
+    - cd /tmp/rf-detr-mirror
+    - git push "${GITLAB_MIRROR_URL}" --all --force
+    - git push "${GITLAB_MIRROR_URL}" --tags --force
