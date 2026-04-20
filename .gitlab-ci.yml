@@ -17,7 +17,7 @@ sync-from-github:
   script:
     - git clone --bare "${GITHUB_MIRROR_URL}" /tmp/rf-detr-mirror
     - cd /tmp/rf-detr-mirror
-    - echo "GitHub yyq_develop HEAD: $(git rev-parse yyq_develop)"
-    - echo "GitLab yyq_develop HEAD before push: $(git ls-remote "${GITLAB_MIRROR_URL}" yyq_develop | awk '{print $1}')"
+    - 'echo "GitHub yyq_develop HEAD: $(git rev-parse yyq_develop)"'
+    - 'echo "GitLab yyq_develop HEAD before push: $(git ls-remote "${GITLAB_MIRROR_URL}" yyq_develop | awk ''{print $1}'')"'
     - git push "${GITLAB_MIRROR_URL}" --all --force
     - git push "${GITLAB_MIRROR_URL}" --tags --force
